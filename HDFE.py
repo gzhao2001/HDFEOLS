@@ -10,7 +10,7 @@ from numba import jit, prange
 import warnings
 
 
-class HDFEFinal:
+class HDFE:
     
     def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk', use_gpu=None, verbose=False):
         self.max_iter = max_iter
@@ -390,7 +390,7 @@ class HDFEFinal:
     
     def fit(self, data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None, sample_weight=None):
         """
-        Fit the HDFEFinal model with robust standard errors
+        Fit the HDFE model with robust standard errors
         
         Parameters:
         -----------
@@ -428,7 +428,7 @@ class HDFEFinal:
         self.X_cols = X_cols
         
         if self.verbose:
-            print(f"Fitting HDFEFinal model with {len(data):,} observations")
+            print(f"Fitting HDFE model with {len(data):,} observations")
             print(f"Continuous variables: {len(X_cols)}")
             print(f"Fixed effects: {len(fe_vars)}")
             print(f"Standard errors: {se_type}")
@@ -696,7 +696,7 @@ class HDFEFinal:
             raise ValueError("Model must be fitted before summary")
             
         print("=" * 80)
-        print("HDFEFinal REGRESSION RESULTS")
+        print("HDFE REGRESSION RESULTS")
         print("(Alternating Projection + Sparse FE Recovery)")
         print("=" * 80)
         print(f"R-squared: {self.r_squared_:.6f}")
