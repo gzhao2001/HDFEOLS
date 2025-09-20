@@ -1,254 +1,299 @@
-# 📖 HDFE Estimator - User Guide
+# HDFE & HDFE-IV: High-Dimensional Fixed Effects Estimators
 
 ## Overview
 
-The **HDFE** estimator is a high-performance implementation for estimating high-dimensional fixed effects models. It combines the precision of sparse matrix solvers with modern GPU acceleration to efficiently handle datasets with millions of observations and thousands of fixed effect categories.
+This notebook implements two powerful econometric estimators for high-dimensional fixed effects models:
+
+- **HDFE**: High-Dimensional Fixed Effects estimator using alternating projection algorithm
+- **HDFE-IV**: High-Dimensional Fixed Effects Instrumental Variables estimator using 2SLS with fixed effects
+
+Both estimators are designed to handle:
+-  **Large datasets** (tested up to 20M+ observations)
+-  **Multiple fixed effects** with thousands of categories each
+-  **GPU acceleration** for faster computation
+-  **Robust standard errors** (homoscedastic, heteroscedastic, cluster-robust)
+-  **Memory efficient** sparse operations
 
 ## Key Features
 
-### 🚀 **Performance**
-- **GPU Acceleration**: Automatic GPU detection with CuPy acceleration for alternating projection and cluster-robust standard errors
-- **Memory Efficient**: Sparse matrix operations handle large datasets without memory overflow
-- **Fast Convergence**: Gearhart-Koshy acceleration method reduces iterations needed
+### HDFE Estimator
+- **Alternating Projection**: Efficient demeaning algorithm with Gearhart-Koshy acceleration
+- **Sparse Fixed Effects Recovery**: Recovers individual fixed effect coefficients using sparse solvers
+- **GPU Support**: Automatic GPU acceleration when available (CuPy)
+- **Robust Standard Errors**: Support for various covariance matrix estimators
 
-### 🔧 **Robust Standard Errors**
-- **Homoscedastic**: Standard OLS assumptions
-- **Heteroscedastic-Consistent**: HC1, HC2, HC3 corrections
-- **Cluster-Robust**: Single or multi-way clustering using Cameron-Gelbach-Miller method
+### HDFE-IV Estimator  
+- **Two-Stage Least Squares**: Full 2SLS implementation with fixed effects demeaning
+- **Multiple Endogenous Variables**: Unlike pyfixest, supports multiple endogenous variables
+- **IV Diagnostics**: First-stage F-statistics, Sargan overidentification test, weak instrument detection
+- **Correct IV Standard Errors**: Proper variance calculation for IV estimates
 
----
-
-## Installation Requirements
+## Installation & Requirements
 
 ```python
 # Required packages
 import pandas as pd
 import numpy as np
-import scipy
-import cupy  # Optional, for GPU acceleration
+from scipy import stats
+from scipy.sparse import csr_matrix, csc_matrix
+from scipy.sparse.linalg import spsolve
+import time
+import psutil
+
+# Optional for GPU acceleration
+import cupy as cp  # pip install cupy-cuda11x or cupy-cuda12x
 ```
 
-## HDFE Class
+## API Reference
 
+### HDFE Class
+
+#### Constructor
 ```python
-from HDFE import HDFE
-model = HDFE(use_gpu=True, max_iter=10000, tolerance=1e-8, 
-    acceleration='gk', verbose=False)
+HDFE(max_iter=5000, tolerance=1e-8, acceleration='gk', use_gpu=None, verbose=False)
 ```
 
 **Parameters:**
-- `use_gpu` (bool): Enable GPU acceleration using CuPy (default: True)
-- `max_iter` (int): Maximum iterations for alternating projection (default: 10,000)
-- `tolerance` (float): Convergence tolerance (default: 1e-8)  
-- `acceleration` (str): Acceleration method - 'gk' (Gearhart-Koshy) or None (default: 'gk')
-- `verbose` (bool): Print detailed progress information (default: False)
+- `max_iter` (int): Maximum iterations for alternating projection algorithm
+- `tolerance` (float): Convergence tolerance for demeaning algorithm  
+- `acceleration` (str): Acceleration method ('gk' for Gearhart-Koshy)
+- `use_gpu` (bool): Force GPU usage (None for auto-detect)
+- `verbose` (bool): Print detailed progress information
 
-### fit() Method
+#### Methods
 
-```python
-model.fit(data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None)
-```
+##### `.fit(data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None, sample_weight=None)`
+
+Fit the HDFE model.
 
 **Parameters:**
 - `data` (DataFrame): Input dataset
 - `y_col` (str): Dependent variable column name
-- `X_cols` (list): List of independent variable column names
-- `fe_vars` (list): List of fixed effect variable column names
-- `se_type` (str): Standard error type - 'homoscedastic', 'hc1', 'hc2', 'hc3', 'cluster'
-- `cluster_vars` (list): Clustering variables for cluster-robust standard errors
+- `X_cols` (list): List of continuous variable column names
+- `fe_vars` (list): List of fixed effect variable column names  
+- `se_type` (str): Standard error type ('homoscedastic', 'hc1', 'hc2', 'hc3', 'cluster')
+- `cluster_vars` (list): Variables to cluster on (required for 'cluster' SE)
+- `sample_weight` (array): Sample weights (optional)
 
-### Model Attributes (After Fitting)
+**Returns:** Self (fitted estimator)
 
-- `coefficients_`: Estimated coefficients (numpy array)
-- `std_errors_`: Standard errors (numpy array)
-- `r_squared_`: R-squared goodness of fit
-- `fe_coefficients_`: Dictionary of recovered fixed effects 
+##### `.summary()`
+Print comprehensive model summary including coefficients, standard errors, and fixed effects statistics.
+
+**Attributes after fitting:**
+- `coefficients_`: Estimated coefficients for continuous variables
+- `std_errors_`: Standard errors for coefficients
+- `t_stats_`: T-statistics  
+- `p_values_`: P-values
+- `r_squared_`: R-squared statistic
+- `fe_coefficients_`: Dictionary of recovered fixed effect coefficients
+- `residuals_`: Model residuals
+- `fitted_values_`: Fitted values
+
+### HDFE-IV Class
+
+#### Constructor  
+```python
+HDFEIV(max_iter=5000, tolerance=1e-8, acceleration='gk', use_gpu=None, verbose=False)
+```
+
+Inherits all HDFE constructor parameters.
+
+#### Methods
+
+##### `.fit(data, y_col, X_cols, fe_vars, instruments, endogenous_vars, se_type='homoscedastic', cluster_vars=None, sample_weight=None)`
+
+Fit the HDFE-IV model using Two-Stage Least Squares.
+
+**Parameters:** 
+- All HDFE parameters plus:
+- `_instruments` (list): List of instrument variable column names
+- `_endogenous_vars` (list): List of endogenous variable column names (subset of X_cols)
+
+**Returns:** Self (fitted estimator)
+
+##### `.first_stage_results()`
+Returns detailed first-stage regression results for each endogenous variable.
+
+##### `.iv_diagnostics()`  
+Returns IV diagnostic tests including weak instrument tests and Sargan overidentification test.
+
+**Additional attributes:**
+- `_first_stage_r2`: First-stage R-squared for each endogenous variable
+- `_first_stage_f_stats`: First-stage F-statistics  
+- `_weak_instruments`: Boolean indicating weak instruments
+- `_sargan_stat`: Sargan test statistic
+- `_sargan_pvalue`: Sargan test p-value
 
 
+## Quick Start Examples
 
-## Basic Usage Examples
-
-### 1. Simple Fixed Effects Model
+### Example 1: Basic HDFE Usage
 
 ```python
-# 📊 DEMO: Creating a Test Dataset
-print("🔧 GENERATING DEMONSTRATION DATASET")
-print("=" * 50)
+# Example 1: Basic HDFE Usage
+# Generate sample data
+np.random.seed(42)
+n_obs = 100_000
+n_firms = 1000
+n_workers = 500
 
-# Set random seed for reproducibility
-np.random.seed(12345)
+# Generate firm and worker IDs  
+firm_ids = np.random.randint(0, n_firms, n_obs)
+worker_ids = np.random.randint(0, n_workers, n_obs)
 
-# Dataset parameters
-n_obs = 50000           # Number of observations
-n_firms = 800           # Number of firms (fe1)
-n_years = 15            # Number of years (fe2)
-n_industries = 25       # Number of industries (for clustering)
+# Generate firm and worker fixed effects
+firm_effects = np.random.normal(0, 1, n_firms)
+worker_effects = np.random.normal(0, 1, n_workers)
 
-print(f"Dataset size: {n_obs:,} observations")
-print(f"Fixed Effects: {n_firms:,} firms, {n_years} years")
-print(f"Clusters: {n_industries} industries")
+# Generate continuous variables
+X1 = np.random.normal(2, 1, n_obs)  # Experience
+X2 = np.random.normal(0, 1, n_obs)  # Education
 
-# Generate base data
-demo_df = pd.DataFrame({
-    'obs_id': range(n_obs),
-    'firm_id': np.random.randint(1, n_firms + 1, n_obs),
-    'year': np.random.randint(2008, 2008 + n_years, n_obs),
-    'industry': np.random.randint(1, n_industries + 1, n_obs)
+# True coefficients
+beta_X1 = 0.05  # Return to experience
+beta_X2 = 0.10  # Return to education
+
+# Generate dependent variable (log wages)
+log_wage = (beta_X1 * X1 + beta_X2 * X2 + 
+           firm_effects[firm_ids] + worker_effects[worker_ids] + 
+           np.random.normal(0, 0.1, n_obs))
+
+# Create DataFrame
+data_example = pd.DataFrame({
+    'log_wage': log_wage,
+    'experience': X1,
+    'education': X2, 
+    'firm_id': firm_ids,
+    'worker_id': worker_ids
 })
 
-# Generate explanatory variables with realistic correlations
-demo_df['experience'] = np.maximum(0, np.random.normal(8, 4, n_obs))  # Work experience
-demo_df['education'] = np.maximum(8, np.random.normal(14, 3, n_obs))   # Years of education
-demo_df['hours'] = np.maximum(20, np.random.normal(40, 8, n_obs))      # Hours worked
+print("📊 Sample Data Generated:")
+print(f"Observations: {n_obs:,}")
+print(f"Firms: {n_firms:,}")  
+print(f"Workers: {n_workers:,}")
+print(f"True β_experience: {beta_X1:.3f}")
+print(f"True β_education: {beta_X2:.3f}")
 
-# Create true fixed effects with realistic variation
-firm_effects = np.random.normal(0, 0.8, n_firms)    # Firm-specific productivity
-year_effects = np.random.normal(0, 0.3, n_years)     # Year-specific trends
-
-# Map effects to observations
-demo_df['firm_effect'] = firm_effects[demo_df['firm_id'] - 1]
-demo_df['year_effect'] = year_effects[demo_df['year'] - 2008]
-
-# Generate log wage with realistic coefficients
-true_beta = np.array([0.08, 0.12, 0.02])  # Returns to experience, education, hours
-
-log_wage = (
-    10.5 +                                      # Base wage
-    true_beta[0] * demo_df['experience'] +      # Experience premium
-    true_beta[1] * demo_df['education'] +       # Education premium  
-    true_beta[2] * demo_df['hours'] +           # Hours effect
-    demo_df['firm_effect'] +                    # Firm fixed effect
-    demo_df['year_effect'] +                    # Year fixed effect
-    np.random.normal(0, 0.4, n_obs)            # Error term
-)
-
-demo_df['log_wage'] = log_wage
-
-# Remove helper columns for clean dataset
-demo_clean = demo_df[['obs_id', 'firm_id', 'year', 'industry', 
-                      'experience', 'education', 'hours', 'log_wage']].copy()
-
-print(f"\n✅ Demo dataset created successfully!")
-print(f"Shape: {demo_clean.shape}")
-print(f"\nFirst 5 observations:")
-print(demo_clean.head())
-
-print(f"\n📊 Dataset Summary:")
-print("-" * 30)
-print(f"Mean log wage: {demo_clean['log_wage'].mean():.3f}")
-print(f"Firms range: {demo_clean['firm_id'].min()} to {demo_clean['firm_id'].max()}")
-print(f"Years range: {demo_clean['year'].min()} to {demo_clean['year'].max()}")
-print(f"True coefficients: Experience={true_beta[0]:.3f}, Education={true_beta[1]:.3f}, Hours={true_beta[2]:.3f}")
-```
-
-```python
-# Example 1: Basic Fixed Effects Model
-print("🎯 EXAMPLE 1: BASIC FIXED EFFECTS MODEL")
-print("=" * 55)
-print("Model: log_wage ~ experience + education | firm_id + year")
-print("Standard errors: Homoscedastic (default)")
-
-# Create and fit basic model
-model_basic = HDFE(verbose=True)
-
-model_basic.fit(
-    data=demo_clean,
+# Fit HDFE model
+hdfe_example = HDFE(verbose=True, use_gpu=False)  # Use CPU for small example
+hdfe_example.fit(
+    data=data_example,
     y_col='log_wage',
     X_cols=['experience', 'education'],
-    fe_vars=['firm_id', 'year']
+    fe_vars=['firm_id', 'worker_id'],
+    se_type='homoscedastic'
 )
 
-print("\n📊 RESULTS:")
-print("-" * 25)
-print(f"Coefficients:")
-print(f"  Experience: {model_basic.coefficients_[0]:.6f} (SE: {model_basic.std_errors_[0]:.6f})")
-print(f"  Education:  {model_basic.coefficients_[1]:.6f} (SE: {model_basic.std_errors_[1]:.6f})")
-print(f"\nModel Statistics:")
-print(f"  R-squared: {model_basic.r_squared_:.6f}")
-print(f"  Observations: {len(demo_clean):,}")
-
-# Check if we have fixed effects recovered
-if hasattr(model_basic, 'recovered_fe_') and model_basic.recovered_fe_:
-    fe_count = sum(len(v) for v in model_basic.recovered_fe_.values())
-    print(f"  Fixed Effects: {len(model_basic.recovered_fe_)} categories, {fe_count:,} total values")
-else:
-    print(f"  Fixed Effects: 2 categories (firm_id, year)")
-
-print(f"\n✅ Coefficient Recovery:")
-true_coeffs_basic = [0.080, 0.120]  # True experience and education effects
-for i, (true, est) in enumerate(zip(true_coeffs_basic, model_basic.coefficients_)):
-    var_name = ['Experience', 'Education'][i]
-    error = abs(est - true)
-    recovery_pct = (1 - error/abs(true)) * 100
-    print(f"  {var_name}: True={true:.3f}, Estimated={est:.6f}, Recovery={recovery_pct:.1f}%")
-
-print("\n" + "="*55)
+# Display results
+print("\n" + "="*60)
+print("HDFE ESTIMATION RESULTS")
+print("="*60)
+hdfe_example.summary()
 ```
 
-### 2. Multi-Way Clustering and Heteroscedastic-Consistent Standard Errors
+### Example 2: HDFE-IV with Endogeneity
 
 ```python
-# Example 3: Comparing Different Standard Error Types
-print("🎯 EXAMPLE 3: STANDARD ERROR TYPE COMPARISON")
-print("=" * 65)
-print("Model: log_wage ~ experience + education | firm_id + year")
+# Example 2: HDFE-IV with Endogeneity
+# Generate data with endogenous variable (e.g., training participation)
 
-# Dictionary to store results for comparison
-se_comparison = {}
+np.random.seed(123)
+n_obs = 500_000
+n_firms = 800  
+n_workers = 400
 
-se_types_demo = [
-    ('Homoscedastic', 'homoscedastic', None),
-    ('HC1', 'hc1', None),
-    ('HC3', 'hc3', None),
-    ('Single Cluster', 'cluster', ['industry']),
-    ('Multi-way Cluster', 'cluster', ['industry', 'firm_id'])
-]
+# Generate IDs and fixed effects
+firm_ids = np.random.randint(0, n_firms, n_obs)
+worker_ids = np.random.randint(0, n_workers, n_obs)
+firm_effects = np.random.normal(0, 0.8, n_firms)
+worker_effects = np.random.normal(0, 0.8, n_workers)
 
-print("\nFitting models with different standard error specifications...")
+# Generate error term
+error_term = np.random.normal(0, 0.2, n_obs)
 
-for se_name, se_type, cluster_vars in se_types_demo:
-    print(f"\n🔧 Computing {se_name} standard errors...")
+# Generate instruments (policy variables)
+Z1 = np.random.normal(0, 1, n_obs)  # Policy instrument 1
+Z2 = np.random.normal(1, 1, n_obs)  # Policy instrument 2
+
+# Generate exogenous variables
+X1_exog = np.random.normal(2, 1, n_obs)  # Experience (exogenous)
+
+# Generate endogenous variable (training participation)
+# Correlated with error term (unobserved ability affects both training and wages)
+X2_endog = (0.7 * Z1 + 0.5 * Z2 +           # Instrument relevance
+            0.8 * error_term +               # Endogeneity correlation
+            0.2 * firm_effects[firm_ids] +   # Firm effect on training
+            np.random.normal(0, 0.5, n_obs)) # Random component
+
+# True coefficients
+beta_experience = 0.08
+beta_training = 0.15    # True training effect (will be biased in OLS)
+
+# Generate dependent variable (log wages)
+log_wage = (beta_experience * X1_exog + 
+            beta_training * X2_endog +
+            firm_effects[firm_ids] + worker_effects[worker_ids] + 
+            error_term)
+
+# Create DataFrame
+data_iv_example = pd.DataFrame({
+    'log_wage': log_wage,
+    'experience': X1_exog,
+    'training': X2_endog,
+    'policy_Z1': Z1,
+    'policy_Z2': Z2, 
+    'firm_id': firm_ids,
+    'worker_id': worker_ids
+})
+
+print("📊 IV Example Data Generated:")
+print(f"Observations: {n_obs:,}")
+print(f"Endogeneity correlation: {np.corrcoef(X2_endog, error_term)[0,1]:.3f}")
+print(f"True β_experience: {beta_experience:.3f}")
+print(f"True β_training: {beta_training:.3f}")
+
+print("\n🔧 Comparing HDFE (biased) vs HDFE-IV (corrected)...")
+
+# 1. Fit HDFE (will show endogeneity bias)
+hdfe_biased = HDFE(verbose=False, use_gpu=False)
+hdfe_biased.fit(
+    data=data_iv_example,
+    y_col='log_wage', 
+    X_cols=['experience', 'training'],
+    fe_vars=['firm_id', 'worker_id'],
+    se_type='homoscedastic'
+)
+
+# 2. Fit HDFE-IV (should correct the bias)
+hdfeiv_corrected = HDFEIV(verbose=False, use_gpu=False)
+hdfeiv_corrected.fit(
+    data=data_iv_example,
+    y_col='log_wage',
+    X_cols=['experience', 'training'], 
+    fe_vars=['firm_id', 'worker_id'],
+    instruments=['policy_Z1', 'policy_Z2'],
+    endogenous_vars=['training'],
+    se_type='homoscedastic'
+)
+
+# Compare results
+print("\n" + "="*80)
+print("COMPARISON: HDFE (Biased) vs HDFE-IV (Corrected)")
+print("="*80)
+print(f"{'Variable':<12} {'True':<8} {'HDFE':<12} {'HDFE-IV':<12} {'Bias_HDFE':<12} {'Bias_IV':<12}")
+print("-"*80)
+
+for i, var in enumerate(['experience', 'training']):
+    true_val = beta_experience if var == 'experience' else beta_training
+    hdfe_coef = hdfe_biased.coefficients_[i]
+    hdfeiv_coef = hdfeiv_corrected.coefficients_[i]
     
-    model_se = HDFE(use_gpu=True, verbose=False)
-    model_se.fit(
-        data=demo_clean,
-        y_col='log_wage',
-        X_cols=['experience', 'education'],
-        fe_vars=['firm_id', 'year'],
-        se_type=se_type,
-        cluster_vars=cluster_vars
-    )
+    bias_hdfe = ((hdfe_coef - true_val) / true_val) * 100
+    bias_iv = ((hdfeiv_coef - true_val) / true_val) * 100
     
-    se_comparison[se_name] = {
-        'coeffs': model_se.coefficients_.copy(),
-        'se': model_se.std_errors_.copy(),
-        'r2': model_se.r_squared_
-    }
+    print(f"{var:<12} {true_val:<8.3f} {hdfe_coef:<12.3f} {hdfeiv_coef:<12.3f} {bias_hdfe:<12.1f}% {bias_iv:<12.1f}%")
 
-# Display comparison table
-print("\n📊 STANDARD ERROR COMPARISON TABLE:")
-print("=" * 80)
-print(f"{'SE Type':<18} {'Experience':<20} {'Education':<20} {'R²':<10}")
-print(f"{'':18} {'Coef (SE)':<20} {'Coef (SE)':<20} {'':10}")
-print("-" * 80)
-
-for se_name in se_comparison:
-    coef_exp = se_comparison[se_name]['coeffs'][0]
-    se_exp = se_comparison[se_name]['se'][0]
-    coef_edu = se_comparison[se_name]['coeffs'][1]
-    se_edu = se_comparison[se_name]['se'][1]
-    r2 = se_comparison[se_name]['r2']
-    
-    print(f"{se_name:<18} {coef_exp:.4f} ({se_exp:.5f})  {coef_edu:.4f} ({se_edu:.5f})  {r2:.6f}")
-
-print("\n🔍 KEY OBSERVATIONS:")
-print("-" * 40)
-print("• Coefficients remain identical across SE types (as expected)")
-print("• Cluster-robust SEs are typically larger than homoscedastic SEs")
-print("• Multi-way clustering captures correlation in multiple dimensions") 
-print("• GPU acceleration speeds up cluster SE computation significantly")
-
-print("\n" + "="*65)
+print("\n💡 Key Insight: HDFE-IV corrects the endogeneity bias in the training coefficient!")
+print("="*80)
 ```
-
-
