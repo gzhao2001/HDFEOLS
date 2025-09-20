@@ -50,6 +50,7 @@ import cupy as cp  # pip install cupy-cuda11x or cupy-cuda12x
 
 #### Constructor
 ```python
+from HDFE import HDFE
 HDFE(max_iter=5000, tolerance=1e-8, acceleration='gk', use_gpu=None, verbose=False)
 ```
 
@@ -94,6 +95,7 @@ Print comprehensive model summary including coefficients, standard errors, and f
 
 #### Constructor  
 ```python
+from HDFE import HDFEIV
 HDFEIV(max_iter=5000, tolerance=1e-8, acceleration='gk', use_gpu=None, verbose=False)
 ```
 
