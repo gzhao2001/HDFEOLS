@@ -3,729 +3,569 @@
 import pandas as pd
 import numpy as np
 from scipy import stats
-from scipy.sparse import csr_matrix, hstack
-from scipy.sparse.linalg import spsolve
+from matplotlib import pyplot as plt
+import time
+import psutil
+import pyfixest as pf
 import numba
 from numba import jit, prange
+from scipy.sparse import csr_matrix, csc_matrix, eye as speye
+from scipy.sparse.linalg import spsolve
+from sklearn.preprocessing import LabelEncoder
 import warnings
-
+import cupy as cp
 
 class HDFE:
-    
-    def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk', use_gpu=None, verbose=False):
+    """
+    High-Dimensional Fixed Effects estimator using alternating projection
+    demeaning with sparse-system fixed effects recovery.
+    """
+
+    def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk',
+                 use_gpu=None, verbose=False):
         self.max_iter = max_iter
         self.tolerance = tolerance
         self.acceleration = acceleration
         self.verbose = verbose
-        
+
         # GPU setup
         if use_gpu is None:
             try:
                 import cupy as cp
                 self.use_gpu = cp.cuda.is_available()
                 if self.verbose and self.use_gpu:
-                    print("✅ GPU detected and will be used")
+                    print("GPU detected and will be used")
                 elif self.verbose:
-                    print("⚠️ GPU not available, using CPU")
+                    print("GPU not available, using CPU")
             except ImportError:
                 self.use_gpu = False
                 if self.verbose:
-                    print("⚠️ CuPy not installed, using CPU")
+                    print("CuPy not installed, using CPU")
         else:
             self.use_gpu = use_gpu
-            
-        # Initialize state
+
+        # State
         self.fitted = False
         self.fe_vars = []
         self.category_orders_ = {}
         self.category_to_index_ = {}
         self.n_categories = {}
 
+    # ── Category encoding (vectorised) ──────────────────────────────────────
+
     def _establish_category_ordering(self, data, fe_vars):
-        """Establish consistent category ordering"""
         for fe_var in fe_vars:
             if fe_var not in self.category_orders_:
-                unique_cats_str = data[fe_var].astype(str).unique()
+                unique_cats_str = data[fe_var].dropna().astype(str).unique()
                 try:
-                    unique_cats_numeric = sorted([int(cat) for cat in unique_cats_str])
-                    unique_cats = [str(cat) for cat in unique_cats_numeric]
+                    unique_cats_numeric = sorted([int(c) for c in unique_cats_str])
+                    unique_cats = [str(c) for c in unique_cats_numeric]
                 except ValueError:
                     unique_cats = sorted(unique_cats_str)
-                
                 self.category_orders_[fe_var] = unique_cats
-                self.category_to_index_[fe_var] = {cat: idx for idx, cat in enumerate(unique_cats)}
+                self.category_to_index_[fe_var] = {
+                    cat: idx for idx, cat in enumerate(unique_cats)}
                 self.n_categories[fe_var] = len(unique_cats)
-                
         return self._encode_with_consistent_ordering(data, fe_vars)
-        
+
     def _encode_with_consistent_ordering(self, data, fe_vars):
-        """Encode categorical variables using consistent ordering"""
         encoded_data = data.copy()
         for fe_var in fe_vars:
-            category_map = self.category_to_index_[fe_var]
-            encoded_values = []
-            for val in data[fe_var].astype(str):
-                if val in category_map:
-                    encoded_values.append(category_map[val])
-                else:
-                    encoded_values.append(-1)
-            encoded_data[fe_var] = np.array(encoded_values)
+            cat_map = self.category_to_index_[fe_var]
+            encoded_data[fe_var] = (data[fe_var].astype(str)
+                                    .map(cat_map).fillna(-1)
+                                    .astype(int).values)
         return encoded_data
 
+    # ── Group demeaning ─────────────────────────────────────────────────────
+
     def _cpu_demean_by_group(self, data, group_indices, n_groups):
-        """CPU version of group demeaning using Numba"""
-        result = data.copy()
-        group_sums = np.zeros(n_groups, dtype=np.float64)
-        group_counts = np.zeros(n_groups, dtype=np.float64)
-        
-        # Calculate group sums and counts
-        for i in range(len(data)):
-            if group_indices[i] >= 0:
-                group_sums[group_indices[i]] += data[i]
-                group_counts[group_indices[i]] += 1.0
-        
-        # Calculate group means
+        """CPU group demeaning (vectorised, negative-index safe)."""
+        valid = group_indices >= 0
+        safe_idx = np.where(valid, group_indices, 0)
+        group_sums = np.bincount(
+            safe_idx,
+            weights=np.where(valid, data, 0.0),
+            minlength=n_groups).astype(np.float64)
+        group_counts = np.bincount(
+            safe_idx,
+            weights=valid.astype(np.float64),
+            minlength=n_groups)
         group_means = np.zeros(n_groups, dtype=np.float64)
-        for j in range(n_groups):
-            if group_counts[j] > 0:
-                group_means[j] = group_sums[j] / group_counts[j]
-        
-        # Subtract group means
-        for i in range(len(data)):
-            if group_indices[i] >= 0:
-                result[i] = data[i] - group_means[group_indices[i]]
-        
+        nz = group_counts > 0
+        group_means[nz] = group_sums[nz] / group_counts[nz]
+        result = data.copy()
+        result[valid] = data[valid] - group_means[group_indices[valid]]
         return result, group_means
 
     def _gpu_demean_by_group(self, data_gpu, group_indices_gpu, n_groups):
-        """GPU version of group demeaning"""
+        """GPU group demeaning (vectorised, negative-index safe — C6 fix)."""
         import cupy as cp
-        
-        group_sums = cp.bincount(group_indices_gpu, weights=data_gpu, minlength=n_groups)
-        group_counts = cp.bincount(group_indices_gpu, minlength=n_groups)
-        
+        valid = group_indices_gpu >= 0
+        safe_idx = cp.where(valid, group_indices_gpu, cp.int32(0))
+        group_sums = cp.bincount(
+            safe_idx,
+            weights=cp.where(valid, data_gpu, 0.0),
+            minlength=n_groups).astype(cp.float64)
+        group_counts = cp.bincount(
+            safe_idx,
+            weights=valid.astype(cp.float64),
+            minlength=n_groups)
         group_means = cp.zeros(n_groups, dtype=cp.float64)
-        nonzero_mask = group_counts > 0
-        group_means[nonzero_mask] = group_sums[nonzero_mask] / group_counts[nonzero_mask]
-        
-        result = data_gpu - group_means[group_indices_gpu]
+        nz = group_counts > 0
+        group_means[nz] = group_sums[nz] / group_counts[nz]
+        result = data_gpu.copy()
+        result[valid] = data_gpu[valid] - group_means[group_indices_gpu[valid]]
         return result, group_means
 
+    # ── Alternating projection ──────────────────────────────────────────────
+
     def _alternating_projection(self, y, X, encoded_data, fe_vars):
-        """Alternating projection algorithm with acceleration"""
         if self.verbose:
             print("Starting alternating projection algorithm...")
-            
-        # Determine backend
         if self.use_gpu:
             try:
                 import cupy as cp
+                free_mem = cp.cuda.Device().mem_info[0]
+                required_mem = int((y.nbytes + X.nbytes) * 3)
+                if required_mem > free_mem * 0.85:
+                    raise MemoryError(
+                        f"Insufficient GPU memory ({free_mem/1e9:.1f}GB free, "
+                        f"~{required_mem/1e9:.1f}GB needed)")
                 y_proj = cp.asarray(y, dtype=cp.float64)
                 X_proj = cp.asarray(X, dtype=cp.float64)
-                
-                group_ids_list = []
-                for fe_var in fe_vars:
-                    group_ids = cp.asarray(encoded_data[fe_var].values, dtype=cp.int32)
-                    group_ids_list.append(group_ids)
-                
+                group_ids_list = [
+                    cp.asarray(encoded_data[fv].values, dtype=cp.int32)
+                    for fv in fe_vars]
                 demean_func = self._gpu_demean_by_group
                 backend_name = "GPU"
             except Exception as e:
                 if self.verbose:
-                    print(f"GPU initialization failed: {e}, falling back to CPU")
+                    print(f"GPU init failed: {e}, falling back to CPU")
                 self.use_gpu = False
-                
+
         if not self.use_gpu:
             y_proj = y.copy()
             X_proj = X.copy()
-            group_ids_list = [encoded_data[fe_var].values for fe_var in fe_vars]
+            group_ids_list = [encoded_data[fv].values for fv in fe_vars]
             demean_func = self._cpu_demean_by_group
             backend_name = "CPU"
-            
-        if self.verbose:
-            print(f"Using {backend_name} backend")
 
-        # Store history for acceleration
-        y_history = []
-        X_history = []
-        
+        if self.verbose:
+            print(f"Using {backend_name}, acceleration={self.acceleration}")
+
+        if self.acceleration == 'gk':
+            return self._alternating_projection_gk(
+                y_proj, X_proj, group_ids_list, fe_vars, demean_func)
+        else:
+            return self._alternating_projection_basic(
+                y_proj, X_proj, group_ids_list, fe_vars, demean_func)
+
+    def _alternating_projection_basic(self, y_proj, X_proj, group_ids_list,
+                                       fe_vars, demean_func):
         for iteration in range(self.max_iter):
             y_old = y_proj.copy()
             X_old = X_proj.copy()
-            
-            # Apply one round of demeaning for all fixed effects
             for idx, fe_var in enumerate(fe_vars):
-                group_ids = group_ids_list[idx]
-                n_groups = self.n_categories[fe_var]
-                
-                y_proj, _ = demean_func(y_proj, group_ids, n_groups)
-                
+                gids = group_ids_list[idx]
+                ng = self.n_categories[fe_var]
+                y_proj, _ = demean_func(y_proj, gids, ng)
                 for j in range(X_proj.shape[1]):
-                    X_proj[:, j], _ = demean_func(X_proj[:, j], group_ids, n_groups)
-            
-            # Check convergence
+                    X_proj[:, j], _ = demean_func(X_proj[:, j], gids, ng)
             if self.use_gpu:
                 import cupy as cp
-                y_change = float(cp.mean((y_proj - y_old)**2))
-                X_change = float(cp.mean((X_proj - X_old)**2))
+                y_chg = float(cp.mean((y_proj - y_old)**2))
+                X_chg = float(cp.mean((X_proj - X_old)**2))
             else:
-                y_change = np.mean((y_proj - y_old)**2)
-                X_change = np.mean((X_proj - X_old)**2)
-            
-            # Apply Gearhart-Koshy acceleration
-            if self.acceleration == 'gk' and len(y_history) >= 2:
-                y_current = y_proj
-                X_current = X_proj
-                
-                # Get previous iterations
-                y_prev1 = y_history[-1]
-                y_prev2 = y_history[-2]
-                X_prev1 = X_history[-1]
-                X_prev2 = X_history[-2]
-                
-                # Apply acceleration
-                y_proj = self._apply_gk_acceleration(y_current, y_prev1, y_prev2)
-                X_proj = self._apply_gk_acceleration(X_current, X_prev1, X_prev2)
-            
-            # Store history
-            y_history.append(y_proj.copy())
-            X_history.append(X_proj.copy())
-            
-            # Keep only last 2 iterations for memory efficiency
-            if len(y_history) > 3:
-                y_history.pop(0)
-                X_history.pop(0)
-            
+                y_chg = np.mean((y_proj - y_old)**2)
+                X_chg = np.mean((X_proj - X_old)**2)
             if self.verbose and iteration % 200 == 0:
-                print(f"Iteration {iteration}: y_change = {y_change:.2e}, X_change = {X_change:.2e}")
-            
-            if y_change < self.tolerance and X_change < self.tolerance:
+                print(f"  iter {iteration}: y_chg={y_chg:.2e}, X_chg={X_chg:.2e}")
+            if y_chg < self.tolerance and X_chg < self.tolerance:
                 if self.verbose:
-                    print(f"Converged after {iteration + 1} iterations")
+                    print(f"  Converged after {iteration+1} iterations")
                 break
         else:
             if self.verbose:
-                print(f"Warning: Maximum iterations ({self.max_iter}) reached")
-        
-        # Convert back from GPU if needed
+                print(f"  Warning: max iterations ({self.max_iter}) reached")
         if self.use_gpu:
             import cupy as cp
-            y_projected = cp.asnumpy(y_proj)
-            X_projected = cp.asnumpy(X_proj)
+            return cp.asnumpy(y_proj), cp.asnumpy(X_proj)
+        return y_proj, X_proj
+
+    def _alternating_projection_gk(self, y_proj, X_proj, group_ids_list,
+                                    fe_vars, demean_func):
+        y_hist, X_hist = [], []
+        for iteration in range(self.max_iter):
+            y_old = y_proj.copy()
+            X_old = X_proj.copy()
+            for idx, fe_var in enumerate(fe_vars):
+                gids = group_ids_list[idx]
+                ng = self.n_categories[fe_var]
+                y_proj, _ = demean_func(y_proj, gids, ng)
+                for j in range(X_proj.shape[1]):
+                    X_proj[:, j], _ = demean_func(X_proj[:, j], gids, ng)
+            if self.use_gpu:
+                import cupy as cp
+                y_chg = float(cp.mean((y_proj - y_old)**2))
+                X_chg = float(cp.mean((X_proj - X_old)**2))
+            else:
+                y_chg = np.mean((y_proj - y_old)**2)
+                X_chg = np.mean((X_proj - X_old)**2)
+            if len(y_hist) >= 2:
+                y_proj = self._apply_gk_acceleration(
+                    y_proj, y_hist[-1], y_hist[-2])
+                X_proj = self._apply_gk_acceleration(
+                    X_proj, X_hist[-1], X_hist[-2])
+            y_hist.append(y_proj.copy())
+            X_hist.append(X_proj.copy())
+            if len(y_hist) > 3:
+                y_hist.pop(0); X_hist.pop(0)
+            if self.verbose and iteration % 200 == 0:
+                print(f"  iter {iteration}: y_chg={y_chg:.2e}, X_chg={X_chg:.2e}")
+            if y_chg < self.tolerance and X_chg < self.tolerance:
+                if self.verbose:
+                    print(f"  Converged after {iteration+1} iterations")
+                break
         else:
-            y_projected = y_proj
-            X_projected = X_proj
-            
-        return y_projected, X_projected
-    
-    def _apply_gk_acceleration(self, current, previous1, previous2):
-        """Apply Gearhart-Koshy acceleration"""
+            if self.verbose:
+                print(f"  Warning: max iterations ({self.max_iter}) reached")
         if self.use_gpu:
             import cupy as cp
-            diff1 = current - previous1
-            diff2 = previous1 - previous2
-            
-            numerator = cp.sum(diff1 * diff2)
-            denominator = cp.sum(diff2 * diff2)
-            
-            if abs(float(denominator)) > self.tolerance:
-                alpha = float(numerator / denominator)
-                alpha = max(0, min(alpha, 1))  # Clamp between 0 and 1
-                accelerated = current + alpha * diff1
-                return accelerated
+            return cp.asnumpy(y_proj), cp.asnumpy(X_proj)
+        return y_proj, X_proj
+
+    def _apply_gk_acceleration(self, current, prev1, prev2):
+        if self.use_gpu:
+            import cupy as cp
+            d1 = current - prev1; d2 = prev1 - prev2
+            denom = cp.sum(d2 * d2)
+            if abs(float(denom)) > self.tolerance:
+                a = float(cp.sum(d1 * d2) / denom)
+                a = max(0, min(a, 1))
+                return current + a * d1
         else:
-            diff1 = current - previous1
-            diff2 = previous1 - previous2
-            
-            numerator = np.sum(diff1 * diff2)
-            denominator = np.sum(diff2 * diff2)
-            
-            if abs(denominator) > self.tolerance:
-                alpha = numerator / denominator
-                alpha = max(0, min(alpha, 1))  # Clamp between 0 and 1
-                accelerated = current + alpha * diff1
-                return accelerated
-                
+            d1 = current - prev1; d2 = prev1 - prev2
+            denom = np.sum(d2 * d2)
+            if abs(denom) > self.tolerance:
+                a = np.sum(d1 * d2) / denom
+                a = max(0, min(a, 1))
+                return current + a * d1
         return current
 
+    # ── Sparse dummy matrix & FE recovery ───────────────────────────────────
+
     def _build_dummy_matrix(self, encoded_data, fe_vars):
-        """Build sparse dummy matrix for fixed effects - from HDFEGpu implementation"""
+        """Build sparse dummy matrix for FE recovery (vectorised)."""
+        if len(fe_vars) == 0:                                   # H2
+            raise ValueError("fe_vars must be non-empty for dummy matrix construction")
         n_obs = len(encoded_data)
-        
-        # Calculate total columns needed
-        total_cols = self.n_categories[fe_vars[0]]  # First FE: all categories
-        for fe_var in fe_vars[1:]:
-            total_cols += self.n_categories[fe_var] - 1  # Other FEs: drop one category
-        
-        row_indices = []
-        col_indices = []
-        data_values = []
+        total_cols = self.n_categories[fe_vars[0]]
+        for fv in fe_vars[1:]:
+            total_cols += self.n_categories[fv] - 1
+
+        all_rows, all_cols = [], []
         fe_col_info = {}
-        current_col = 0
-        
-        for fe_idx, fe_var in enumerate(fe_vars):
-            n_cats = self.n_categories[fe_var]
-            group_ids = encoded_data[fe_var].values
-            
+        cur = 0
+        for fe_idx, fv in enumerate(fe_vars):
+            nc = self.n_categories[fv]
+            gids = encoded_data[fv].values
             if fe_idx == 0:
-                # First fixed effect: include all categories
-                fe_col_info[fe_var] = {
-                    'start_col': current_col, 
-                    'end_col': current_col + n_cats,
-                    'n_categories': n_cats, 
-                    'dropped_category': None
-                }
-                
-                for i in range(n_obs):
-                    if group_ids[i] >= 0:
-                        row_indices.append(i)
-                        col_indices.append(current_col + group_ids[i])
-                        data_values.append(1.0)
-                        
-                current_col += n_cats
-                
+                fe_col_info[fv] = {
+                    'start_col': cur, 'end_col': cur + nc,
+                    'n_categories': nc, 'dropped_category': None}
+                v = gids >= 0
+                all_rows.append(np.where(v)[0])
+                all_cols.append(cur + gids[v])
+                cur += nc
             else:
-                # Other fixed effects: drop first category (category 0)
-                fe_col_info[fe_var] = {
-                    'start_col': current_col, 
-                    'end_col': current_col + n_cats - 1,
-                    'n_categories': n_cats, 
-                    'dropped_category': 0
-                }
-                
-                for i in range(n_obs):
-                    if group_ids[i] >= 1:  # Skip category 0
-                        row_indices.append(i)
-                        col_indices.append(current_col + group_ids[i] - 1)
-                        data_values.append(1.0)
-                        
-                current_col += n_cats - 1
-        
-        from scipy.sparse import csr_matrix
-        D = csr_matrix((data_values, (row_indices, col_indices)), 
-                       shape=(n_obs, total_cols), dtype=np.float64)
-        
+                fe_col_info[fv] = {
+                    'start_col': cur, 'end_col': cur + nc - 1,
+                    'n_categories': nc, 'dropped_category': 0}
+                v = gids >= 1
+                all_rows.append(np.where(v)[0])
+                all_cols.append(cur + gids[v] - 1)
+                cur += nc - 1
+
+        ri = np.concatenate(all_rows)
+        ci = np.concatenate(all_cols)
+        D = csr_matrix((np.ones(len(ri), dtype=np.float64),
+                        (ri, ci)), shape=(n_obs, total_cols))
         return D, fe_col_info
 
-    def _recover_fixed_effects(self, y, X, encoded_data, beta, y_projected, X_projected):
-        """
-        Recover fixed effects using sparse solver - adapted from HDFEGpu implementation
-        This is the correct method that was missing in StreamlinedHDFE_Improved
-        """
+    def _recover_fixed_effects(self, y, X, encoded_data, beta,
+                                y_projected, X_projected,
+                                sample_weight=None):
+        """Recover FE coefficients using sparse solver (C7: weight-aware)."""
         if self.verbose:
             print("Recovering fixed effects using sparse solver...")
-        
-        # Build the sparse dummy matrix
+        if len(self.fe_vars) == 0:
+            return {}
+
         D, fe_col_info = self._build_dummy_matrix(encoded_data, self.fe_vars)
-        
-        # Calculate residuals
-        residuals_original = y - X @ beta
-        residuals_projected = y_projected - X_projected @ beta
-        rhs = residuals_original - residuals_projected
-        
-        # Solve the sparse system: D'D * alpha = D' * rhs
+        res_orig = y - X @ beta
+        res_proj = y_projected - X_projected @ beta
+        rhs = res_orig - res_proj
+
+        # C7: undo sqrt-weighting so FE recovery is in the original scale
+        if sample_weight is not None:
+            sw = np.sqrt(sample_weight)
+            sw_safe = np.where(sw > 0, sw, 1.0)
+            rhs = rhs / sw_safe
+
         try:
-            from scipy.sparse.linalg import spsolve
-            from scipy.sparse import hstack
-            
-            DtD = D.T @ D
-            Dtr = D.T @ rhs
-            
-            # Try GPU sparse solving first if available
+            DtD = D.T @ D;  Dtr = D.T @ rhs
             if self.use_gpu:
                 try:
                     import cupy as cp
-                    import cupyx.scipy.sparse
-                    import cupyx.scipy.sparse.linalg
-                    
-                    if self.verbose:
-                        print("🚀 Using GPU for sparse solving...")
-                    
-                    DtD_gpu = cupyx.scipy.sparse.csr_matrix(DtD.astype(np.float64))
-                    Dtr_gpu = cp.asarray(Dtr.astype(np.float64))
-                    alpha_gpu = cupyx.scipy.sparse.linalg.spsolve(DtD_gpu, Dtr_gpu)
-                    alpha = cp.asnumpy(alpha_gpu)
-                    
-                    if self.verbose:
-                        print("✅ GPU sparse solve successful!")
-                        
-                except Exception as e:
-                    if self.verbose:
-                        print(f"GPU solve failed ({e}), falling back to CPU...")
+                    import cupyx.scipy.sparse as csp
+                    import cupyx.scipy.sparse.linalg as cspl
+                    alpha = cp.asnumpy(cspl.spsolve(
+                        csp.csr_matrix(DtD.astype(np.float64)),
+                        cp.asarray(Dtr.astype(np.float64))))
+                except Exception:
                     alpha = spsolve(DtD, Dtr)
             else:
                 alpha = spsolve(DtD, Dtr)
-                
-        except Exception as e:
-            if self.verbose:
-                print(f"Sparse solver failed: {e}, using least squares...")
-            alpha = np.linalg.lstsq(D.toarray(), rhs, rcond=None)[0]
-        
-        # Reconstruct fixed effect coefficients
+        except Exception:
+            from scipy.sparse.linalg import lsqr
+            alpha = lsqr(D, rhs)[0]
+
         fe_coefficients = {}
-        current_col = 0
-        
-        for fe_idx, fe_var in enumerate(self.fe_vars):
-            info = fe_col_info[fe_var]
-            n_cats = info['n_categories']
-            
+        for fe_idx, fv in enumerate(self.fe_vars):
+            info = fe_col_info[fv]
+            nc = info['n_categories']
             if fe_idx == 0:
-                # First FE: all categories included
-                fe_coeffs = alpha[info['start_col']:info['end_col']]
-                current_col += n_cats
+                fe_coefficients[fv] = alpha[info['start_col']:info['end_col']]
             else:
-                # Other FEs: reconstruct with dropped category = 0
-                fe_coeffs = np.zeros(n_cats)
-                fe_coeffs[1:] = alpha[info['start_col']:info['end_col']]
-                current_col += n_cats - 1
-            
-            fe_coefficients[fe_var] = fe_coeffs
-        
+                c = np.zeros(nc)
+                c[1:] = alpha[info['start_col']:info['end_col']]
+                fe_coefficients[fv] = c
         if self.verbose:
-            print("Fixed effects recovery completed")
-            for fe_var, coeffs in fe_coefficients.items():
-                print(f"  {fe_var}: mean={np.mean(coeffs):.6f}, std={np.std(coeffs):.6f}")
-        
+            for fv, c in fe_coefficients.items():
+                print(f"  {fv}: mean={np.mean(c):.6f}, std={np.std(c):.6f}")
         return fe_coefficients
-    
-    def fit(self, data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None, sample_weight=None):
-        """
-        Fit the HDFE model with robust standard errors
-        
-        Parameters:
-        -----------
-        data : pandas.DataFrame
-            Input dataset
-        y_col : str
-            Name of dependent variable
-        X_cols : list
-            Names of continuous variables
-        fe_vars : list
-            Names of fixed effect variables
-        se_type : str, default='homoscedastic'
-            Standard error type: 'homoscedastic', 'hc1', 'hc2', 'hc3', 'cluster'
-        cluster_vars : list, optional
-            List of variables to cluster on (required when se_type='cluster')
-        sample_weight : array-like, optional
-            Sample weights
-        """
-        # Validate parameters
+
+    # ── Main fit ────────────────────────────────────────────────────────────
+
+    def fit(self, data, y_col, X_cols, fe_vars,
+            se_type='homoscedastic', cluster_vars=None, sample_weight=None):
         valid_se_types = ['homoscedastic', 'hc1', 'hc2', 'hc3', 'cluster']
         if se_type not in valid_se_types:
             raise ValueError(f"se_type must be one of {valid_se_types}")
-            
         if se_type == 'cluster' and cluster_vars is None:
-            raise ValueError("cluster_vars must be specified when se_type='cluster'")
-            
+            raise ValueError("cluster_vars required when se_type='cluster'")
         if se_type == 'cluster' and not isinstance(cluster_vars, list):
             cluster_vars = [cluster_vars]
-        
-        # Store parameters
+        if not fe_vars:                                         # H2
+            raise ValueError("fe_vars must be non-empty for HDFE estimation")
+
         self.se_type = se_type
         self.cluster_vars = cluster_vars
         self.fe_vars = fe_vars
         self.y_col = y_col
         self.X_cols = X_cols
-        
+
         if self.verbose:
-            print(f"Fitting HDFE model with {len(data):,} observations")
-            print(f"Continuous variables: {len(X_cols)}")
-            print(f"Fixed effects: {len(fe_vars)}")
-            print(f"Standard errors: {se_type}")
-            if se_type == 'cluster':
-                print(f"Clustering on: {cluster_vars}")
-            print(f"Using {'GPU' if self.use_gpu else 'CPU'} acceleration")
-        
-        # Prepare data
+            print(f"Fitting HDFE: {len(data):,} obs, {len(X_cols)} vars, "
+                  f"{len(fe_vars)} FEs, SE={se_type}, "
+                  f"{'GPU' if self.use_gpu else 'CPU'}")
+
         if hasattr(data, 'to_pandas'):
             data = data.to_pandas()
-            
         encoded_data = self._establish_category_ordering(data, fe_vars)
-        
+
         y = data[y_col].values.astype(np.float64)
         X = data[X_cols].values.astype(np.float64)
-        
-        # Handle missing data
         valid_mask = ~(np.isnan(y) | np.any(np.isnan(X), axis=1))
-        y = y[valid_mask]
-        X = X[valid_mask]
+        # H-REMAIN-1: exclude rows with NaN in FE columns
+        for fv in fe_vars:
+            valid_mask &= data[fv].notna().values
+        y = y[valid_mask]; X = X[valid_mask]
         encoded_data = encoded_data[valid_mask]
-        
-        # Apply sample weights if provided
+
+        self._sample_weight = None
         if sample_weight is not None:
             sample_weight = sample_weight[valid_mask]
+            self._sample_weight = sample_weight
             y = y * np.sqrt(sample_weight)
             X = X * np.sqrt(sample_weight).reshape(-1, 1)
-        
-        # Apply alternating projection
-        y_projected, X_projected = self._alternating_projection(y, X, encoded_data, fe_vars)
-        
-        # Estimate continuous coefficients
-        XtX = X_projected.T @ X_projected
-        Xty = X_projected.T @ y_projected
-        
-        self.coefficients_ = np.linalg.solve(XtX, Xty)
-        
-        # Recover fixed effects using sparse solver
-        self.fe_coefficients_ = self._recover_fixed_effects(y, X, encoded_data, self.coefficients_, 
-                                                           y_projected, X_projected)
-        
-        # Store transformed data for robust SE calculation
-        self.X_projected = X_projected
-        self.y_projected = y_projected
-        
-        # Calculate model statistics with robust standard errors
-        self._calculate_statistics(y, X, encoded_data, X_projected, data)
-        
+
+        y_proj, X_proj = self._alternating_projection(y, X, encoded_data, fe_vars)
+        self.coefficients_ = np.linalg.solve(
+            X_proj.T @ X_proj, X_proj.T @ y_proj)
+        # C7: pass weights for correct FE recovery
+        self.fe_coefficients_ = self._recover_fixed_effects(
+            y, X, encoded_data, self.coefficients_, y_proj, X_proj,
+            sample_weight=self._sample_weight)
+        self.X_projected = X_proj
+        self.y_projected = y_proj
+        self._calculate_statistics(
+            y, X, encoded_data, X_proj, data, valid_mask)
         self.fitted = True
         return self
-    
-    def _compute_robust_standard_errors(self, X_projected, residuals, data, valid_mask):
-        """Compute robust standard errors"""
+
+    # ── Standard errors ─────────────────────────────────────────────────────
+
+    def _compute_robust_standard_errors(self, X_proj, residuals, data, valid_mask):
         try:
-            XtX_inv = np.linalg.inv(X_projected.T @ X_projected)
+            XtX_inv = np.linalg.inv(X_proj.T @ X_proj)
         except np.linalg.LinAlgError:
-            XtX_inv = np.linalg.pinv(X_projected.T @ X_projected)
-        
+            XtX_inv = np.linalg.pinv(X_proj.T @ X_proj)
         if self.se_type == 'homoscedastic':
-            # Homoscedastic standard errors
-            sigma2 = np.sum(residuals**2) / (len(residuals) - X_projected.shape[1])
+            sigma2 = np.sum(residuals**2) / self._df_resid
             var_beta = sigma2 * XtX_inv
-            
-        elif self.se_type in ['hc1', 'hc2', 'hc3']:
-            # Heteroscedasticity-robust standard errors
-            meat_matrix = self._compute_hc_matrix(X_projected, residuals, self.se_type)
-            var_beta = XtX_inv @ meat_matrix @ XtX_inv
-            
+        elif self.se_type in ('hc1', 'hc2', 'hc3'):
+            meat = self._compute_hc_matrix(X_proj, residuals, self.se_type)
+            var_beta = XtX_inv @ meat @ XtX_inv
         elif self.se_type == 'cluster':
-            # Multi-variable cluster-robust standard errors
-            meat_matrix = self._compute_multi_cluster_matrix(X_projected, residuals, data, valid_mask)
-            var_beta = XtX_inv @ meat_matrix @ XtX_inv
-        
+            meat = self._compute_multi_cluster_matrix(
+                X_proj, residuals, data, valid_mask)
+            var_beta = XtX_inv @ meat @ XtX_inv
         return np.sqrt(np.diag(var_beta))
-    
+
     def _compute_hc_matrix(self, X, residuals, hc_type):
-        """Compute heteroscedasticity-consistent covariance matrix"""
         n, k = X.shape
-        
         if hc_type == 'hc1':
-            # HC1: multiply by n/(n-k) adjustment
-            weights = (residuals**2) * n / (n - k)
+            w = (residuals**2) * n / (n - k)
         elif hc_type == 'hc2':
-            # HC2: account for leverage
-            h = np.sum(X * (np.linalg.solve(X.T @ X, X.T).T), axis=1)
-            weights = (residuals**2) / (1 - h)
+            h = np.sum(X * np.linalg.solve(X.T @ X, X.T).T, axis=1)
+            w = (residuals**2) / (1 - h)
         elif hc_type == 'hc3':
-            # HC3: squared leverage adjustment  
-            h = np.sum(X * (np.linalg.solve(X.T @ X, X.T).T), axis=1)
-            weights = (residuals**2) / ((1 - h)**2)
-        
-        # Handle potential numerical issues
-        weights = np.clip(weights, 0, np.percentile(weights, 99.9))
-        
-        weighted_X = X * np.sqrt(weights).reshape(-1, 1)
-        return weighted_X.T @ weighted_X
-    
+            h = np.sum(X * np.linalg.solve(X.T @ X, X.T).T, axis=1)
+            w = (residuals**2) / ((1 - h)**2)
+        w = np.where(np.isfinite(w) & (w >= 0), w, 0.0)
+        wX = X * np.sqrt(w).reshape(-1, 1)
+        return wX.T @ wX
+
     def _compute_multi_cluster_matrix(self, X, residuals, data, valid_mask):
-        """Compute multi-variable cluster-robust covariance matrix with GPU acceleration"""
-        if self.verbose and self.se_type == 'cluster':
-            print("🚀 Computing cluster-robust standard errors...")
-            if self.use_gpu:
-                print("   Using GPU acceleration for cluster calculations")
-        
-        # Get cluster data for valid observations
-        cluster_data = {}
-        for cluster_var in self.cluster_vars:
-            cluster_data[cluster_var] = data[cluster_var].values[valid_mask]
-        
-        # Create multi-way clustering groups
+        if self.verbose:
+            print("Computing cluster-robust SEs...")
+        cdat = {}
+        for cv in self.cluster_vars:
+            cdat[cv] = data[cv].values[valid_mask]
         if len(self.cluster_vars) == 1:
-            # Single variable clustering
-            cluster_groups = cluster_data[self.cluster_vars[0]]
+            cg = cdat[self.cluster_vars[0]]
         else:
-            # Multi-variable clustering: create interaction of all cluster variables
-            cluster_groups = cluster_data[self.cluster_vars[0]].astype(str)
-            for cluster_var in self.cluster_vars[1:]:
-                cluster_groups = cluster_groups + "_" + cluster_data[cluster_var].astype(str)
-        
-        # GPU-accelerated cluster computation
+            cg = cdat[self.cluster_vars[0]].astype(str)
+            for cv in self.cluster_vars[1:]:
+                cg = cg + "_" + cdat[cv].astype(str)
         if self.use_gpu:
             try:
-                return self._compute_cluster_matrix_gpu(X, residuals, cluster_groups)
-            except Exception as e:
-                if self.verbose:
-                    print(f"GPU cluster computation failed ({e}), falling back to CPU...")
-                return self._compute_cluster_matrix_cpu(X, residuals, cluster_groups)
-        else:
-            return self._compute_cluster_matrix_cpu(X, residuals, cluster_groups)
-    
-    def _compute_cluster_matrix_gpu(self, X, residuals, cluster_groups):
-        """GPU-accelerated cluster-robust covariance matrix computation"""
-        import cupy as cp
-        
-        # Move data to GPU
-        X_gpu = cp.asarray(X, dtype=cp.float64)
-        residuals_gpu = cp.asarray(residuals, dtype=cp.float64)
-        
-        # Get unique clusters and create mapping
-        unique_clusters = np.unique(cluster_groups)
-        n_clusters = len(unique_clusters)
-        k = X.shape[1]
-        
-        if self.verbose and n_clusters > 1000:
-            print(f"   Processing {n_clusters:,} clusters on GPU...")
-        
-        # Create cluster index mapping
-        cluster_to_idx = {cluster: idx for idx, cluster in enumerate(unique_clusters)}
-        cluster_indices = np.array([cluster_to_idx[cluster] for cluster in cluster_groups])
-        cluster_indices_gpu = cp.asarray(cluster_indices, dtype=cp.int32)
-        
-        # Initialize meat matrix on GPU
-        meat_matrix_gpu = cp.zeros((k, k), dtype=cp.float64)
-        
-        # Process clusters in batches to manage GPU memory
-        batch_size = min(max(1000, 10000 // k), n_clusters)
-        
-        for batch_start in range(0, n_clusters, batch_size):
-            batch_end = min(batch_start + batch_size, n_clusters)
-            
-            # Process batch of clusters
-            for cluster_idx in range(batch_start, batch_end):
-                cluster_mask_gpu = cluster_indices_gpu == cluster_idx
-                
-                # Extract cluster data
-                X_cluster_gpu = X_gpu[cluster_mask_gpu]
-                resid_cluster_gpu = residuals_gpu[cluster_mask_gpu]
-                
-                if X_cluster_gpu.shape[0] > 0:  # Check if cluster is not empty
-                    # Compute cluster contribution: (X'r)(X'r)'
-                    cluster_contribution_gpu = X_cluster_gpu.T @ resid_cluster_gpu
-                    meat_matrix_gpu += cp.outer(cluster_contribution_gpu, cluster_contribution_gpu)
-        
-        # Convert back to CPU
-        meat_matrix = cp.asnumpy(meat_matrix_gpu)
-        
-        # Cleanup GPU memory
-        del X_gpu, residuals_gpu, cluster_indices_gpu, meat_matrix_gpu
-        try:
-            cp.get_default_memory_pool().free_all_blocks()
-        except:
-            pass
-            
-        return meat_matrix
-    
-    def _compute_cluster_matrix_cpu(self, X, residuals, cluster_groups):
-        """CPU fallback for cluster-robust covariance matrix computation"""
-        meat_matrix = np.zeros((X.shape[1], X.shape[1]))
-        unique_clusters = np.unique(cluster_groups)
-        
-        if self.verbose and len(unique_clusters) > 1000:
-            print(f"   Processing {len(unique_clusters):,} clusters on CPU...")
-        
-        for cluster in unique_clusters:
-            cluster_mask = cluster_groups == cluster
-            X_cluster = X[cluster_mask]
-            resid_cluster = residuals[cluster_mask]
-            
-            # Cluster contribution: sum of X_i * residual_i within cluster
-            cluster_contribution = (X_cluster.T @ resid_cluster).reshape(-1, 1)
-            meat_matrix += cluster_contribution @ cluster_contribution.T
-        
-        return meat_matrix
+                return self._cluster_gpu(X, residuals, cg)
+            except Exception:
+                pass
+        return self._cluster_cpu(X, residuals, cg)
 
-    def _calculate_statistics(self, y, X, encoded_data, X_projected, original_data):
-        """Calculate model fit statistics with robust standard errors"""
-        # Create valid_mask to track which observations were used
-        valid_mask = ~(np.isnan(y) | np.any(np.isnan(X), axis=1))
-        
-        # Full predictions including fixed effects
-        y_pred_full = X @ self.coefficients_
-        for fe_var in self.fe_vars:
-            group_ids = encoded_data[fe_var].values
-            for i in range(len(y)):
-                if group_ids[i] >= 0:
-                    y_pred_full[i] += self.fe_coefficients_[fe_var][group_ids[i]]
-        
-        residuals_full = y - y_pred_full
-        self.residuals_ = residuals_full
-        self.fitted_values_ = y_pred_full
-        
-        # R-squared
+    def _cluster_gpu(self, X, residuals, cg):
+        import cupy as cp
+        Xg = cp.asarray(X, dtype=cp.float64)
+        rg = cp.asarray(residuals, dtype=cp.float64)
+        uq = np.unique(cg); nc = len(uq); k = X.shape[1]
+        c2i = {c: i for i, c in enumerate(uq)}
+        ci = cp.asarray(np.array([c2i[c] for c in cg]), dtype=cp.int32)
+        meat = cp.zeros((k, k), dtype=cp.float64)
+        for j in range(nc):
+            m = ci == j
+            if cp.any(m):
+                s = Xg[m].T @ rg[m]
+                meat += cp.outer(s, s)
+        out = cp.asnumpy(meat)
+        del Xg, rg, ci, meat
+        try: cp.get_default_memory_pool().free_all_blocks()
+        except: pass
+        return out
+
+    def _cluster_cpu(self, X, residuals, cg):
+        meat = np.zeros((X.shape[1], X.shape[1]))
+        for c in np.unique(cg):
+            m = cg == c
+            s = (X[m].T @ residuals[m]).reshape(-1, 1)
+            meat += s @ s.T
+        return meat
+
+    # ── Statistics ──────────────────────────────────────────────────────────
+
+    def _calculate_statistics(self, y, X, encoded_data, X_proj,
+                               original_data, valid_mask):
+        y_pred = X @ self.coefficients_
+        for fv in self.fe_vars:
+            gids = encoded_data[fv].values
+            v = gids >= 0
+            fe_contrib = self.fe_coefficients_[fv][gids[v]]
+            if self._sample_weight is not None:
+                fe_contrib = fe_contrib * np.sqrt(self._sample_weight[v])
+            y_pred[v] += fe_contrib
+        resid = y - y_pred
+        self.residuals_ = resid
+        self.fitted_values_ = y_pred
         tss = np.sum((y - np.mean(y))**2)
-        rss = np.sum(residuals_full**2)
+        rss = np.sum(resid**2)
         self.r_squared_ = 1 - rss / tss
-        
-        # Compute robust standard errors
-        if self.verbose:
-            print(f"Computing {self.se_type} standard errors...")
-        
+
+        # dof (H3 warning if dangerously low)
+        if len(self.fe_vars) > 0:
+            df_abs = self.n_categories[self.fe_vars[0]]
+            for fv in self.fe_vars[1:]:
+                df_abs += self.n_categories[fv] - 1
+        else:
+            df_abs = 0
+        self._df_resid = max(len(y) - X.shape[1] - df_abs, 1)
+        if self._df_resid <= X.shape[1]:
+            warnings.warn(
+                f"Very low residual dof ({self._df_resid}). "
+                f"N={len(y)}, k={X.shape[1]}, absorbed={df_abs}. "
+                "SEs may be unreliable.", stacklevel=2)
+
         try:
-            self.std_errors_ = self._compute_robust_standard_errors(X_projected, residuals_full, 
-                                                                   original_data, valid_mask)
-            
-            # t-statistics and p-values
+            self.std_errors_ = self._compute_robust_standard_errors(
+                X_proj, resid, original_data, valid_mask)
             self.t_stats_ = self.coefficients_ / self.std_errors_
-            from scipy import stats
-            df_resid = len(y) - X.shape[1] - sum(self.n_categories.values())
-            self.p_values_ = 2 * (1 - stats.t.cdf(np.abs(self.t_stats_), df_resid))
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"Warning: Could not compute robust standard errors: {e}")
-            
-            # Fallback to basic standard errors
-            df_resid = len(y) - X.shape[1] - sum(self.n_categories.values())
-            mse = np.sum(residuals_full**2) / df_resid
-            
+            self.p_values_ = 2 * (1 - stats.t.cdf(
+                np.abs(self.t_stats_), self._df_resid))
+        except Exception:
+            mse = rss / self._df_resid
             try:
-                XtX_inv = np.linalg.inv(X_projected.T @ X_projected)
-                var_coef = mse * XtX_inv
-                self.std_errors_ = np.sqrt(np.diag(var_coef))
-                
+                inv = np.linalg.inv(X_proj.T @ X_proj)
+                self.std_errors_ = np.sqrt(np.diag(mse * inv))
                 self.t_stats_ = self.coefficients_ / self.std_errors_
-                from scipy import stats
-                self.p_values_ = 2 * (1 - stats.t.cdf(np.abs(self.t_stats_), df_resid))
+                self.p_values_ = 2 * (1 - stats.t.cdf(
+                    np.abs(self.t_stats_), self._df_resid))
             except Exception:
                 self.std_errors_ = np.full_like(self.coefficients_, np.nan)
                 self.t_stats_ = np.full_like(self.coefficients_, np.nan)
                 self.p_values_ = np.full_like(self.coefficients_, np.nan)
-    
+
+    # ── Summary ─────────────────────────────────────────────────────────────
+
     def summary(self):
-        """Print model summary"""
         if not self.fitted:
             raise ValueError("Model must be fitted before summary")
-            
         print("=" * 80)
         print("HDFE REGRESSION RESULTS")
-        print("(Alternating Projection + Sparse FE Recovery)")
         print("=" * 80)
-        print(f"R-squared: {self.r_squared_:.6f}")
-        print(f"Number of observations: {len(self.residuals_):,}")
-        print(f"Number of fixed effects: {len(self.fe_vars)}")
-        print(f"Standard error type: {self.se_type}")
+        print(f"R²: {self.r_squared_:.6f}")
+        print(f"Observations: {len(self.residuals_):,}  |  df_resid: {self._df_resid:,}")
+        print(f"Fixed effects: {len(self.fe_vars)}  |  SE type: {self.se_type}")
         if hasattr(self, 'cluster_vars') and self.cluster_vars:
-            print(f"Clustering variables: {self.cluster_vars}")
-        print(f"Fixed effect categories: {dict(self.n_categories)}")
-        
-        print("\nContinuous Variable Coefficients:")
-        print("-" * 80)
-        print(f"{'Variable':<20} {'Coef':<12} {'Std Err':<12} {'t':<8} {'P>|t|':<8}")
-        print("-" * 80)
-        
-        for i, var in enumerate(self.X_cols):
+            print(f"Clustering: {self.cluster_vars}")
+        print(f"FE categories: {dict(self.n_categories)}")
+        hdr = f"\n{'Variable':<20} {'Coef':<12} {'Std Err':<12} {'t':<8} {'P>|t|':<8}"
+        print(hdr); print("-" * 60)
+        for i, v in enumerate(self.X_cols):
             if not np.isnan(self.std_errors_[i]):
-                print(f"{var:<20} {self.coefficients_[i]:<12.6f} {self.std_errors_[i]:<12.6f} "
+                print(f"{v:<20} {self.coefficients_[i]:<12.6f} "
+                      f"{self.std_errors_[i]:<12.6f} "
                       f"{self.t_stats_[i]:<8.3f} {self.p_values_[i]:<8.3f}")
             else:
-                print(f"{var:<20} {self.coefficients_[i]:<12.6f} {'N/A':<12} {'N/A':<8} {'N/A':<8}")
-        
-        print("\nFixed Effects Summary:")
-        print("-" * 60)
-        for fe_var in self.fe_vars:
-            fe_coeffs = self.fe_coefficients_[fe_var]
-            print(f"{fe_var}: mean={np.mean(fe_coeffs):.6f}, std={np.std(fe_coeffs):.6f}, "
-                  f"min={np.min(fe_coeffs):.6f}, max={np.max(fe_coeffs):.6f}")
-        
+                print(f"{v:<20} {self.coefficients_[i]:<12.6f} "
+                      f"{'N/A':<12} {'N/A':<8} {'N/A':<8}")
+        print("\nFixed Effects Summary:"); print("-" * 60)
+        for fv in self.fe_vars:
+            c = self.fe_coefficients_[fv]
+            print(f"  {fv}: mean={np.mean(c):.4f}, std={np.std(c):.4f}, "
+                  f"min={np.min(c):.4f}, max={np.max(c):.4f}")
+
         print("=" * 80)
 
 
@@ -733,506 +573,498 @@ class HDFE:
 class HDFEIV(HDFE):
     """
     High-Dimensional Fixed Effects Instrumental Variables (HDFE-IV) estimator.
-    
-    Extends HDFE to support instrumental variables estimation using two-stage least squares (2SLS).
-    When no instruments are provided, falls back to standard HDFE estimation.
-    
-    The algorithm performs:
-    1. Alternating projection demeaning on Y, X, and Z (instruments)
-    2. First stage: regress endogenous variables on instruments (both demeaned)
-    3. Second stage: 2SLS regression using demeaned data
-    4. Robust standard errors with IV-specific corrections
+
+    Extends HDFE with two-stage least squares (2SLS) estimation.  When no
+    instruments are supplied, falls back to standard HDFE-OLS.
     """
-    
-    def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk', use_gpu=None, verbose=False):
+
+    def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk',
+                 use_gpu=None, verbose=False):
         super().__init__(max_iter, tolerance, acceleration, use_gpu, verbose)
-        
-        # IV-specific attributes
+        self._reset_iv_state()
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _reset_iv_state(self):
+        """Clear all IV-specific state (called at the start of every fit)."""
         self._is_iv = False
         self._instruments = None
         self._endogenous_vars = None
         self._exogenous_vars = None
-        
-        # First stage results
+
         self._first_stage_models = {}
         self._first_stage_fitted = {}
         self._first_stage_residuals = {}
         self._first_stage_r2 = {}
         self._first_stage_f_stats = {}
-        
-        # 2SLS matrices
+
         self._tZX = None
-        self._tXZ = None  
+        self._tXZ = None
         self._tZy = None
         self._tZZinv = None
-        
-        # IV diagnostics
+        self._Z_full = None
+
         self._weak_instruments = False
         self._sargan_stat = None
         self._sargan_pvalue = None
-        
-    def fit(self, data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None, 
-            sample_weight=None, instruments=None, endogenous_vars=None):
+
+    # ── fit ──────────────────────────────────────────────────────────────────
+
+    def fit(self, data, y_col, X_cols, fe_vars, se_type='homoscedastic',
+            cluster_vars=None, sample_weight=None, instruments=None,
+            endogenous_vars=None):
         """
         Fit HDFE-IV model with optional instrumental variables.
-        
-        Parameters:
-        -----------
-        data : pandas.DataFrame
-            Input dataset
+
+        Parameters
+        ----------
+        data : DataFrame
         y_col : str
-            Name of dependent variable
-        X_cols : list
-            Names of continuous variables (exogenous + endogenous)
-        fe_vars : list
-            Names of fixed effect variables  
-        se_type : str, default='homoscedastic'
-            Standard error type: 'homoscedastic', 'hc1', 'hc2', 'hc3', 'cluster'
+        X_cols : list – continuous variables (exogenous + endogenous)
+        fe_vars : list – fixed-effect variables
+        se_type : str – 'homoscedastic', 'hc1', 'cluster'
+                        (hc2/hc3 not supported for IV)
         cluster_vars : list, optional
-            List of variables to cluster on (required when se_type='cluster')
         sample_weight : array-like, optional
-            Sample weights
-        instruments : list, optional
-            List of instrument variable column names. If None, falls back to HDFE
-        endogenous_vars : list, optional
-            List of endogenous variable column names (subset of X_cols)
-            
-        Returns:
-        --------
-        self : HDFEIV
-            Fitted estimator instance
+        instruments : list, optional – excluded instrument column names
+        endogenous_vars : list, optional – subset of X_cols
         """
-        
-        # Store IV-specific parameters
+        self._reset_iv_state()
+
         self._instruments = instruments
         self._endogenous_vars = endogenous_vars if endogenous_vars else []
-        
-        # Determine if this is IV estimation
-        self._is_iv = (instruments is not None and len(instruments) > 0 and 
-                      endogenous_vars is not None and len(endogenous_vars) > 0)
-        
+        self._is_iv = (instruments is not None and len(instruments) > 0 and
+                       endogenous_vars is not None and len(endogenous_vars) > 0)
+
         if not self._is_iv:
-            # Fall back to standard HDFE estimation
             if self.verbose:
                 print("No instruments provided, running standard HDFE estimation...")
-            return super().fit(data, y_col, X_cols, fe_vars, se_type, cluster_vars, sample_weight)
-        
-        # IV-specific validation
+            return super().fit(data, y_col, X_cols, fe_vars, se_type,
+                               cluster_vars, sample_weight)
+
+        if se_type in ('hc2', 'hc3'):
+            raise NotImplementedError(
+                f"se_type='{se_type}' is not supported for IV models. "
+                "Use 'homoscedastic', 'hc1', or 'cluster'.")
+
         if not set(endogenous_vars).issubset(set(X_cols)):
             raise ValueError("All endogenous variables must be in X_cols")
-        
         if len(instruments) < len(endogenous_vars):
-            raise ValueError("Number of instruments must be >= number of endogenous variables")
-            
-        # Identify exogenous variables
+            raise ValueError(
+                "Number of instruments must be >= number of endogenous variables")
+
+        valid_se_types = ['homoscedastic', 'hc1', 'cluster']
+        if se_type not in valid_se_types:
+            raise ValueError(f"se_type must be one of {valid_se_types} for IV")
+        if se_type == 'cluster' and cluster_vars is None:
+            raise ValueError("cluster_vars must be specified when se_type='cluster'")
+        if se_type == 'cluster' and not isinstance(cluster_vars, list):
+            cluster_vars = [cluster_vars]
+        if not fe_vars:                                         # H2
+            raise ValueError("fe_vars must be non-empty for HDFE estimation")
+
         self._exogenous_vars = [x for x in X_cols if x not in endogenous_vars]
-        
-        # Store parameters for parent class compatibility
         self.se_type = se_type
         self.cluster_vars = cluster_vars
         self.fe_vars = fe_vars
         self.y_col = y_col
         self.X_cols = X_cols
-        
+
         if self.verbose:
-            print(f"Fitting HDFE-IV model with {len(data):,} observations")
-            print(f"Exogenous variables: {len(self._exogenous_vars)}")
-            print(f"Endogenous variables: {len(endogenous_vars)}")
-            print(f"Instruments: {len(instruments)}")
-            print(f"Fixed effects: {len(fe_vars)}")
-            print(f"Standard errors: {se_type}")
-            if se_type == 'cluster':
-                print(f"Clustering on: {cluster_vars}")
-            print(f"Using {'GPU' if self.use_gpu else 'CPU'} acceleration")
-            
+            print(f"Fitting HDFE-IV: {len(data):,} obs, "
+                  f"{len(self._exogenous_vars)} exog, "
+                  f"{len(endogenous_vars)} endog, "
+                  f"{len(instruments)} instruments, "
+                  f"{len(fe_vars)} FEs, SE={se_type}")
+
         # Prepare data
         if hasattr(data, 'to_pandas'):
             data = data.to_pandas()
-            
-        # Establish category ordering for fixed effects
         encoded_data = self._establish_category_ordering(data, fe_vars)
-        
-        # Extract and validate data
+
         y = data[y_col].values.astype(np.float64)
         X = data[X_cols].values.astype(np.float64)
         Z = data[instruments].values.astype(np.float64)
-        
-        # Handle missing data
-        valid_mask = ~(np.isnan(y) | np.any(np.isnan(X), axis=1) | np.any(np.isnan(Z), axis=1))
+
+        valid_mask = ~(np.isnan(y) | np.any(np.isnan(X), axis=1)
+                       | np.any(np.isnan(Z), axis=1))
+        # H-REMAIN-1: exclude rows with NaN in FE columns
+        for fv in fe_vars:
+            valid_mask &= data[fv].notna().values
         y = y[valid_mask]
-        X = X[valid_mask] 
+        X = X[valid_mask]
         Z = Z[valid_mask]
         encoded_data = encoded_data[valid_mask]
-        
-        # Apply sample weights if provided
+
+        self._sample_weight = None
         if sample_weight is not None:
             sample_weight = sample_weight[valid_mask]
-            y = y * np.sqrt(sample_weight)
-            X = X * np.sqrt(sample_weight).reshape(-1, 1)
-            Z = Z * np.sqrt(sample_weight).reshape(-1, 1)
-        
-        # Step 1: Demean Y, X, and Z using alternating projection
+            self._sample_weight = sample_weight
+            sw_sqrt = np.sqrt(sample_weight)
+            y = y * sw_sqrt
+            X = X * sw_sqrt.reshape(-1, 1)
+            Z = Z * sw_sqrt.reshape(-1, 1)
+
+        # Demean all columns in one pass
         if self.verbose:
-            print("Step 1: Demeaning Y, X, and instruments...")
-            
-        y_demeaned, X_demeaned = self._alternating_projection(y, X, encoded_data, fe_vars)
-        _, Z_demeaned = self._alternating_projection(np.zeros_like(y), Z, encoded_data, fe_vars)
-        
-        # Step 2: First stage regressions
+            print("  Demeaning y, X, Z (single pass)...")
+        combined = np.column_stack([X, Z])
+        y_demeaned, combined_demeaned = self._alternating_projection(
+            y, combined, encoded_data, fe_vars)
+        X_demeaned = combined_demeaned[:, :X.shape[1]]
+        Z_demeaned = combined_demeaned[:, X.shape[1]:]
+
+        # First stage
         if self.verbose:
-            print("Step 2: Running first stage regressions...")
-            
+            print("  First stage regressions...")
         self._run_first_stage(X_demeaned, Z_demeaned)
-        
-        # Step 3: Second stage 2SLS estimation
+
+        # Second stage (direct 2SLS formula)
         if self.verbose:
-            print("Step 3: Running second stage 2SLS...")
-            
-        self._run_second_stage(y_demeaned, X_demeaned, Z_demeaned)
-        
-        # Step 4: Recover fixed effects using sparse solver
-        self.fe_coefficients_ = self._recover_fixed_effects(y, X, encoded_data, self.coefficients_, 
-                                                           y_demeaned, X_demeaned)
-        
-        # Store demeaned data for robust SE calculation
+            print("  Second stage 2SLS...")
+        self._run_second_stage(y_demeaned, X_demeaned)
+
+        # Recover fixed effects (C7: pass weights)
+        self.fe_coefficients_ = self._recover_fixed_effects(
+            y, X, encoded_data, self.coefficients_, y_demeaned, X_demeaned,
+            sample_weight=self._sample_weight)
+
         self.X_projected = X_demeaned
         self.y_projected = y_demeaned
-        
-        # Step 5: Calculate model statistics with IV-robust standard errors
-        self._calculate_iv_statistics(y, X, Z, encoded_data, X_demeaned, data, valid_mask)
-        
-        # Step 6: IV diagnostics
+
+        # dof
+        if len(self.fe_vars) > 0:
+            df_absorbed = self.n_categories[self.fe_vars[0]]
+            for fe in self.fe_vars[1:]:
+                df_absorbed += self.n_categories[fe] - 1
+        else:
+            df_absorbed = 0
+        self._df_resid = max(len(y) - X.shape[1] - df_absorbed, 1)
+
+        # H3: warn when residual dof is dangerously low
+        if self._df_resid <= X.shape[1]:
+            warnings.warn(
+                f"Very low residual degrees of freedom ({self._df_resid}). "
+                f"N={len(y)}, k={X.shape[1]}, absorbed={df_absorbed}. "
+                "Standard errors may be unreliable.",
+                stacklevel=2)
+
+        # Statistics
+        self._calculate_iv_statistics(
+            y, X, Z, encoded_data, X_demeaned, data, valid_mask)
+
+        # Diagnostics
         if self.verbose:
-            print("Step 4: Computing IV diagnostics...")
+            print("  IV diagnostics...")
         self._compute_iv_diagnostics()
-        
+
         self.fitted = True
         return self
-    
+
+    # ── first stage ─────────────────────────────────────────────────────────
+
     def _run_first_stage(self, X_demeaned, Z_demeaned):
-        """Run first stage regressions for each endogenous variable"""
-        
-        # Get indices of endogenous variables in X_cols
-        endog_indices = [self.X_cols.index(var) for var in self._endogenous_vars]
-        
-        for i, endog_var in enumerate(self._endogenous_vars):
-            endog_idx = endog_indices[i]
-            
-            # First stage: X_endog = Z * pi + residuals
-            X_endog = X_demeaned[:, endog_idx]
-            
-            try:
-                # Solve Z'Z * pi = Z'X_endog
-                ZTZ = Z_demeaned.T @ Z_demeaned
-                ZTX_endog = Z_demeaned.T @ X_endog
-                
-                pi_hat = np.linalg.solve(ZTZ, ZTX_endog)
-                X_fitted = Z_demeaned @ pi_hat
-                residuals = X_endog - X_fitted
-                
-                # Store first stage results
-                self._first_stage_models[endog_var] = {
-                    'coefficients': pi_hat,
-                    'ZTZ': ZTZ,
-                    'instrument_names': self._instruments
-                }
-                self._first_stage_fitted[endog_var] = X_fitted
-                self._first_stage_residuals[endog_var] = residuals
-                
-                # Compute R² and F-statistic
-                tss = np.sum((X_endog - np.mean(X_endog))**2)
-                rss = np.sum(residuals**2)
-                r2 = 1 - rss / tss
-                self._first_stage_r2[endog_var] = r2
-                
-                # F-statistic for instrument significance
-                n_obs, n_instruments = Z_demeaned.shape
-                f_stat = (r2 / (1 - r2)) * ((n_obs - n_instruments - 1) / n_instruments)
-                self._first_stage_f_stats[endog_var] = f_stat
-                
-                if self.verbose:
-                    print(f"  {endog_var}: R² = {r2:.4f}, F-stat = {f_stat:.2f}")
-                    
-            except np.linalg.LinAlgError:
-                raise ValueError(f"Rank deficient instruments for {endog_var}. Check for multicollinearity.")
-    
-    def _run_second_stage(self, y_demeaned, X_demeaned, Z_demeaned):
-        """Run second stage 2SLS estimation"""
-        
-        # Replace endogenous variables with their fitted values
-        X_2sls = X_demeaned.copy()
-        endog_indices = [self.X_cols.index(var) for var in self._endogenous_vars]
-        
-        for i, endog_var in enumerate(self._endogenous_vars):
-            endog_idx = endog_indices[i]
-            X_2sls[:, endog_idx] = self._first_stage_fitted[endog_var]
-        
-        # Build instrument matrix: [exogenous_X, instruments]
-        exog_indices = [self.X_cols.index(var) for var in self._exogenous_vars]
+        """First-stage regressions on Z_full = [X_exog, Z_excluded]."""
+        exog_indices = [self.X_cols.index(v) for v in self._exogenous_vars]
+
         if len(exog_indices) > 0:
             X_exog = X_demeaned[:, exog_indices]
             Z_full = np.column_stack([X_exog, Z_demeaned])
         else:
-            Z_full = Z_demeaned
-            
-        # Store 2SLS matrices for variance calculation
-        # CRITICAL FIX: Use original X_demeaned, not X_2sls for standard error calculation
-        self._tZX = Z_full.T @ X_demeaned  # Use original X, not fitted X_2sls
-        self._tXZ = X_demeaned.T @ Z_full  # Use original X, not fitted X_2sls
-        self._tZy = Z_full.T @ y_demeaned
-        self._tZZinv = np.linalg.inv(Z_full.T @ Z_full)
-        
-        # Store Z_full for later use in robust standard errors
+            Z_full = Z_demeaned.copy()
+
         self._Z_full = Z_full
-        
-        # 2SLS estimation: β = (X'Z(Z'Z)^(-1)Z'X)^(-1) * X'Z(Z'Z)^(-1)Z'y
-        # But for the actual estimation, we DO use X_2sls (with fitted values)
-        tZX_2sls = Z_full.T @ X_2sls
-        tXZ_2sls = X_2sls.T @ Z_full
-        
-        try:
-            H = tXZ_2sls @ self._tZZinv    # X_2sls'Z(Z'Z)^(-1)
-            A = H @ tZX_2sls              # X_2sls'Z(Z'Z)^(-1)Z'X_2sls  
-            B = H @ self._tZy             # X_2sls'Z(Z'Z)^(-1)Z'y
-            
-            self.coefficients_ = np.linalg.solve(A, B)
-            
-            if self.verbose:
-                print(f"  2SLS coefficients estimated successfully")
-                
-        except np.linalg.LinAlgError:
-            raise ValueError("2SLS estimation failed. Check for identification issues.")
-    
-    def _compute_iv_diagnostics(self):
-        """Compute IV diagnostic tests"""
-        
-        # Check for weak instruments (F-stat < 10 rule of thumb)
-        min_f_stat = min(self._first_stage_f_stats.values()) if self._first_stage_f_stats else 0
-        self._weak_instruments = min_f_stat < 10.0
-        
-        if self.verbose:
-            print(f"  Minimum first-stage F-statistic: {min_f_stat:.2f}")
-            if self._weak_instruments:
-                print("  ⚠️ Warning: Potentially weak instruments (F < 10)")
-            else:
-                print("  ✅ Instruments appear adequately strong")
-                
-        # Sargan test for overidentification (if overidentified)
-        n_endog = len(self._endogenous_vars)  
-        n_instruments = len(self._instruments)
-        
-        if n_instruments > n_endog:
+        ZTZ_full = Z_full.T @ Z_full
+
+        endog_indices = [self.X_cols.index(v) for v in self._endogenous_vars]
+
+        for i, endog_var in enumerate(self._endogenous_vars):
+            X_endog = X_demeaned[:, endog_indices[i]]
+
             try:
-                # Get 2SLS residuals
-                residuals = self.y_projected - self.X_projected @ self.coefficients_
-                
-                # Regress residuals on all instruments
-                Z_full = np.column_stack([self.X_projected[:, [self.X_cols.index(var) for var in self._exogenous_vars]] if self._exogenous_vars else np.empty((len(residuals), 0)), 
-                                         np.column_stack([self._first_stage_fitted[var] for var in self._endogenous_vars])])
-                
-                aux_r2 = 1 - np.sum((residuals - Z_full @ np.linalg.lstsq(Z_full, residuals, rcond=None)[0])**2) / np.sum((residuals - np.mean(residuals))**2)
-                
-                # Sargan statistic ~ χ²(J) where J = # instruments - # endogenous
-                n_obs = len(residuals)
-                self._sargan_stat = n_obs * aux_r2
-                
-                # p-value from chi-squared distribution
-                from scipy import stats
-                df_sargan = n_instruments - n_endog
-                self._sargan_pvalue = 1 - stats.chi2.cdf(self._sargan_stat, df_sargan)
-                
+                ZTX = Z_full.T @ X_endog
+                pi_hat = np.linalg.solve(ZTZ_full, ZTX)
+                X_fitted = Z_full @ pi_hat
+                residuals = X_endog - X_fitted
+
+                self._first_stage_models[endog_var] = {
+                    'coefficients': pi_hat,
+                    'instrument_names': self._exogenous_vars + self._instruments
+                }
+                self._first_stage_fitted[endog_var] = X_fitted
+                self._first_stage_residuals[endog_var] = residuals
+
+                tss = np.sum((X_endog - np.mean(X_endog))**2)
+                rss = np.sum(residuals**2)
+                r2 = 1 - rss / tss
+                self._first_stage_r2[endog_var] = r2
+
+                # Partial F-stat for *excluded* instruments only
+                if len(exog_indices) > 0:
+                    pi_restricted = np.linalg.solve(
+                        X_exog.T @ X_exog, X_exog.T @ X_endog)
+                    rss_restricted = np.sum(
+                        (X_endog - X_exog @ pi_restricted)**2)
+                    q = Z_demeaned.shape[1]
+                    n_obs = len(X_endog)
+                    k_full = Z_full.shape[1]
+                    f_stat = ((rss_restricted - rss) / q) / (rss / (n_obs - k_full))
+                else:
+                    n_obs = len(X_endog)
+                    k = Z_demeaned.shape[1]
+                    f_stat = (r2 / max(1 - r2, 1e-30)) * ((n_obs - k) / k)
+
+                self._first_stage_f_stats[endog_var] = f_stat
+
                 if self.verbose:
-                    print(f"  Sargan test: χ² = {self._sargan_stat:.3f}, p-value = {self._sargan_pvalue:.3f}")
-                    if self._sargan_pvalue < 0.05:
-                        print("  ⚠️ Warning: Sargan test rejects instrument validity (p < 0.05)")
-                    else:
-                        print("  ✅ Sargan test does not reject instrument validity")
-                        
-            except Exception as e:
-                if self.verbose:
-                    print(f"  Warning: Could not compute Sargan test: {e}")
-                self._sargan_stat = None
-                self._sargan_pvalue = None
-    
-    def _calculate_iv_statistics(self, y, X, Z, encoded_data, X_demeaned, original_data, valid_mask):
-        """Calculate model fit statistics with IV-robust standard errors"""
-        
-        # Full predictions including fixed effects
+                    print(f"    {endog_var}: R²={r2:.4f}, partial-F={f_stat:.2f}")
+
+            except np.linalg.LinAlgError:
+                raise ValueError(
+                    f"Rank-deficient instruments for {endog_var}. "
+                    "Check for multicollinearity.")
+
+    # ── second stage ────────────────────────────────────────────────────────
+
+    def _run_second_stage(self, y_demeaned, X_demeaned):
+        """
+        2SLS with original X_demeaned (not X_2sls with fitted values).
+
+        β = (X'Z (Z'Z)^{-1} Z'X)^{-1}  X'Z (Z'Z)^{-1} Z'y
+        """
+        Z = self._Z_full
+
+        self._tZX    = Z.T @ X_demeaned
+        self._tXZ    = X_demeaned.T @ Z
+        self._tZy    = Z.T @ y_demeaned
+        self._tZZinv = np.linalg.inv(Z.T @ Z)
+
+        try:
+            H = self._tXZ @ self._tZZinv
+            A = H @ self._tZX
+            b = H @ self._tZy
+            self.coefficients_ = np.linalg.solve(A, b)
+            if self.verbose:
+                print("    2SLS coefficients computed.")
+        except np.linalg.LinAlgError:
+            raise ValueError(
+                "2SLS estimation failed – check for identification issues.")
+
+    # ── IV standard errors ──────────────────────────────────────────────────
+
+    def _compute_iv_robust_standard_errors(self, X_demeaned, residuals,
+                                           data, valid_mask):
+        """
+        IV-robust standard errors using the correct sandwich formula.
+
+        Var(β) = A^{-1} B A^{-1}
+        where A = X'Z(Z'Z)^{-1}Z'X
+        and B depends on se_type.
+        """
+        Z = self._Z_full
+        A = self._tXZ @ self._tZZinv @ self._tZX
+        A_inv = np.linalg.inv(A)
+
+        if self.se_type == 'homoscedastic':
+            sigma2 = np.sum(residuals**2) / self._df_resid
+            var_beta = sigma2 * A_inv
+
+        elif self.se_type == 'hc1':
+            n = len(residuals)
+            k = X_demeaned.shape[1]
+            e2 = residuals**2
+            meat_ZZ = (Z * e2.reshape(-1, 1)).T @ Z
+            meat_ZZ *= n / max(n - k, 1)
+            B = self._tXZ @ self._tZZinv @ meat_ZZ @ self._tZZinv @ self._tZX
+            var_beta = A_inv @ B @ A_inv
+
+        elif self.se_type == 'cluster':
+            cluster_data = {}
+            for cv in self.cluster_vars:
+                cluster_data[cv] = data[cv].values[valid_mask]
+
+            if len(self.cluster_vars) == 1:
+                cluster_groups = cluster_data[self.cluster_vars[0]]
+            else:
+                cluster_groups = cluster_data[self.cluster_vars[0]].astype(str)
+                for cv in self.cluster_vars[1:]:
+                    cluster_groups = (cluster_groups + "_"
+                                     + cluster_data[cv].astype(str))
+
+            unique_clusters = np.unique(cluster_groups)
+            m_z = Z.shape[1]
+            meat_ZZ = np.zeros((m_z, m_z))
+            for cluster in unique_clusters:
+                mask = cluster_groups == cluster
+                score = Z[mask].T @ residuals[mask]
+                meat_ZZ += np.outer(score, score)
+
+            B = self._tXZ @ self._tZZinv @ meat_ZZ @ self._tZZinv @ self._tZX
+            var_beta = A_inv @ B @ A_inv
+
+        else:
+            raise NotImplementedError(
+                f"se_type='{self.se_type}' not supported for IV.")
+
+        return np.sqrt(np.diag(var_beta))
+
+    # ── IV statistics ───────────────────────────────────────────────────────
+
+    def _calculate_iv_statistics(self, y, X, Z, encoded_data, X_demeaned,
+                                 original_data, valid_mask):
+        """Calculate model statistics with IV-robust standard errors."""
         y_pred_full = X @ self.coefficients_
         for fe_var in self.fe_vars:
             group_ids = encoded_data[fe_var].values
-            for i in range(len(y)):
-                if group_ids[i] >= 0:
-                    y_pred_full[i] += self.fe_coefficients_[fe_var][group_ids[i]]
-        
+            valid = group_ids >= 0
+            fe_contrib = self.fe_coefficients_[fe_var][group_ids[valid]]
+            if self._sample_weight is not None:
+                fe_contrib = fe_contrib * np.sqrt(self._sample_weight[valid])
+            y_pred_full[valid] += fe_contrib
+
         residuals_full = y - y_pred_full
         self.residuals_ = residuals_full
         self.fitted_values_ = y_pred_full
-        
-        # R-squared
+
         tss = np.sum((y - np.mean(y))**2)
         rss = np.sum(residuals_full**2)
         self.r_squared_ = 1 - rss / tss
-        
-        # Compute IV-robust standard errors
         if self.verbose:
-            print(f"Computing {self.se_type} standard errors for IV model...")
-        
+            print(f"  Computing {self.se_type} IV standard errors...")
+
         try:
-            self.std_errors_ = self._compute_iv_robust_standard_errors(X_demeaned, residuals_full, 
-                                                                     original_data, valid_mask)
-            
-            # t-statistics and p-values
+            self.std_errors_ = self._compute_iv_robust_standard_errors(
+                X_demeaned, residuals_full, original_data, valid_mask)
             self.t_stats_ = self.coefficients_ / self.std_errors_
-            from scipy import stats
-            df_resid = len(y) - X.shape[1] - sum(self.n_categories.values())
-            self.p_values_ = 2 * (1 - stats.t.cdf(np.abs(self.t_stats_), df_resid))
-            
+            self.p_values_ = 2 * (1 - stats.t.cdf(
+                np.abs(self.t_stats_), self._df_resid))
         except Exception as e:
             if self.verbose:
-                print(f"Warning: Could not compute IV-robust standard errors: {e}")
-                
-            # Fallback to basic IV standard errors
-            self._compute_basic_iv_standard_errors(X_demeaned, residuals_full)
-    
-    def _compute_iv_robust_standard_errors(self, X_demeaned, residuals, data, valid_mask):
-        """Compute IV-robust standard errors using correct IV sandwich formula"""
-        
-        try:
-            # Use the correct IV variance formula for all cases
-            # Var(β) = σ² × (X'Z(Z'Z)^(-1)Z'X)^(-1)
-            
-            if self.se_type == 'homoscedastic':
-                # Homoscedastic IV standard errors
-                sigma2 = np.sum(residuals**2) / (len(residuals) - X_demeaned.shape[1])
-            elif self.se_type == 'hc1':
-                # HC1 with degrees of freedom adjustment
-                n_obs = len(residuals)
-                k = X_demeaned.shape[1]
-                adjustment = n_obs / (n_obs - k)
-                sigma2 = adjustment * np.sum(residuals**2) / n_obs
-            else:
-                # Fall back to homoscedastic for other robust types
-                sigma2 = np.sum(residuals**2) / (len(residuals) - X_demeaned.shape[1])
-            
-            # Apply correct IV variance formula
-            var_beta_inv = self._tXZ @ self._tZZinv @ self._tZX
-            var_beta = sigma2 * np.linalg.inv(var_beta_inv)
-            
-            return np.sqrt(np.diag(var_beta))
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"IV robust SE calculation failed: {e}, using basic IV SEs...")
-            # Fallback to basic IV standard errors
-            return self._compute_basic_iv_standard_errors(X_demeaned, residuals)
-    
-    def _compute_basic_iv_standard_errors(self, X_demeaned, residuals):
-        """Fallback computation for basic IV standard errors"""
-        try:
-            # Basic IV variance: σ² * (X'Z(Z'Z)^(-1)Z'X)^(-1)
-            sigma2 = np.sum(residuals**2) / (len(residuals) - X_demeaned.shape[1])
-            var_inv = self._tXZ @ self._tZZinv @ self._tZX
-            var_beta = sigma2 * np.linalg.inv(var_inv)
-            
-            return np.sqrt(np.diag(var_beta))
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"Basic IV SE calculation failed: {e}")
-            # Final fallback
-            return np.full_like(self.coefficients_, np.nan)
-    
+                print(f"  Warning: IV SE computation failed: {e}")
+            self.std_errors_ = np.full_like(self.coefficients_, np.nan)
+            self.t_stats_ = np.full_like(self.coefficients_, np.nan)
+            self.p_values_ = np.full_like(self.coefficients_, np.nan)
+
+    # ── IV diagnostics ──────────────────────────────────────────────────────
+
+    def _compute_iv_diagnostics(self):
+        """Weak-instrument check and Sargan over-identification test."""
+        min_f = (min(self._first_stage_f_stats.values())
+                 if self._first_stage_f_stats else 0)
+        self._weak_instruments = min_f < 10.0
+
+        if self.verbose:
+            print(f"    Min first-stage partial-F: {min_f:.2f}"
+                  f"{'  ⚠️ weak' if self._weak_instruments else '  ✅ ok'}")
+        n_excl = len(self._instruments)
+        n_excl = len(self._instruments)
+        n_endog = len(self._endogenous_vars)
+
+        if n_excl > n_endog:
+            try:
+                e = self.y_projected - self.X_projected @ self.coefficients_
+                Z = self._Z_full
+                ZTZ = Z.T @ Z
+                ZTe = Z.T @ e
+                gamma = np.linalg.solve(ZTZ, ZTe)
+                e_hat = Z @ gamma
+                ess = np.sum(e_hat**2)
+                tss_e = np.sum((e - np.mean(e))**2)
+                aux_r2 = ess / tss_e if tss_e > 0 else 0.0
+
+                self._sargan_stat = len(e) * aux_r2
+                df_sargan = n_excl - n_endog
+                self._sargan_pvalue = 1 - stats.chi2.cdf(
+                    self._sargan_stat, df_sargan)
+
+                if self.verbose:
+                    print(f"    Sargan χ²={self._sargan_stat:.3f}  "
+                          f"p={self._sargan_pvalue:.3f}  "
+                          f"(df={df_sargan})")
+            except Exception as e:
+                if self.verbose:
+                    print(f"    Sargan test failed: {e}")
+                self._sargan_stat = None
+                self._sargan_pvalue = None
+
+    # ── summary ─────────────────────────────────────────────────────────────
+
     def summary(self):
-        """Print comprehensive IV model summary"""
+        """Print comprehensive IV model summary."""
         if not self.fitted:
             raise ValueError("Model must be fitted before summary")
-            
-        print("=" * 90)
-        print("HDFE-IV REGRESSION RESULTS") 
-        print("(High-Dimensional Fixed Effects + Instrumental Variables)")
-        print("=" * 90)
-        print(f"Estimation method: {'2SLS with HDFE' if self._is_iv else 'HDFE-OLS'}")
-        print(f"R-squared: {self.r_squared_:.6f}")
-        print(f"Number of observations: {len(self.residuals_):,}")
-        print(f"Fixed effect categories: {dict(self.n_categories)}")
-        print(f"Standard error type: {self.se_type}")
-        if hasattr(self, 'cluster_vars') and self.cluster_vars:
-            print(f"Clustering variables: {self.cluster_vars}")
-        
-        if self._is_iv:
-            print(f"Endogenous variables: {self._endogenous_vars}")
-            print(f"Instruments: {self._instruments}")
-            print(f"Exogenous variables: {self._exogenous_vars}")
-            
-            # IV diagnostics
-            print("\nIV DIAGNOSTICS:")
-            print("-" * 60)
-            print("First Stage Results:")
-            for var in self._endogenous_vars:
-                r2 = self._first_stage_r2.get(var, 0)
-                f_stat = self._first_stage_f_stats.get(var, 0)  
-                print(f"  {var}: R² = {r2:.4f}, F-stat = {f_stat:.2f}")
-            
-            if self._weak_instruments:
-                print("⚠️  WARNING: Weak instruments detected (F < 10)")
-            else:
-                print("✅ Instruments appear adequately strong")
-                
-            if self._sargan_stat is not None:
-                print(f"Sargan test: χ² = {self._sargan_stat:.3f}, p-value = {self._sargan_pvalue:.3f}")
-        
-        print("\nCOEFFICIENT ESTIMATES:")
-        print("-" * 90)
-        print(f"{'Variable':<20} {'Coef':<12} {'Std Err':<12} {'t':<8} {'P>|t|':<8} {'Type':<12}")
-        print("-" * 90)
-        
-        for i, var in enumerate(self.X_cols):
-            var_type = "Endogenous" if var in self._endogenous_vars else "Exogenous"
-            if not np.isnan(self.std_errors_[i]):
-                print(f"{var:<20} {self.coefficients_[i]:<12.6f} {self.std_errors_[i]:<12.6f} "
-                      f"{self.t_stats_[i]:<8.3f} {self.p_values_[i]:<8.3f} {var_type:<12}")
-            else:
-                print(f"{var:<20} {self.coefficients_[i]:<12.6f} {'N/A':<12} {'N/A':<8} {'N/A':<8} {var_type:<12}")
-        
-        print("\nFIXED EFFECTS SUMMARY:")
-        print("-" * 70)
-        for fe_var in self.fe_vars:
-            fe_coeffs = self.fe_coefficients_[fe_var]
-            print(f"{fe_var}: mean={np.mean(fe_coeffs):.6f}, std={np.std(fe_coeffs):.6f}, "
-                  f"min={np.min(fe_coeffs):.6f}, max={np.max(fe_coeffs):.6f}")
-        
-        print("=" * 90)
-    
-    def first_stage_results(self):
-        """Return detailed first stage regression results"""
+
         if not self._is_iv:
-            print("No first stage results available (not an IV model)")
-            return None
-            
-        results = {}
+            return super().summary()
+
+        print("=" * 90)
+        print("HDFE-IV REGRESSION RESULTS (2SLS with HDFE)")
+        print("=" * 90)
+        print(f"R²: {self.r_squared_:.6f}  |  N: {len(self.residuals_):,}  |  "
+              f"df_resid: {self._df_resid:,}")
+        print(f"SE type: {self.se_type}")
+        if self.cluster_vars:
+            print(f"Cluster: {self.cluster_vars}")
+        print(f"Endogenous: {self._endogenous_vars}")
+        print(f"Excluded instruments: {self._instruments}")
+        print(f"Exogenous: {self._exogenous_vars}")
+
+        print("\nFirst Stage:")
+        print("-" * 60)
         for var in self._endogenous_vars:
-            results[var] = {
-                'coefficients': self._first_stage_models[var]['coefficients'],
-                'instrument_names': self._instruments,
-                'r_squared': self._first_stage_r2[var],
-                'f_statistic': self._first_stage_f_stats[var],
-                'fitted_values': self._first_stage_fitted[var],
-                'residuals': self._first_stage_residuals[var]
-            }
-        return results
-    
-    def iv_diagnostics(self):
-        """Return IV diagnostic test results"""
+            print(f"  {var}: R²={self._first_stage_r2[var]:.4f}  "
+                  f"partial-F={self._first_stage_f_stats[var]:.2f}")
+        if self._weak_instruments:
+            print("  ⚠️  Weak instruments (F < 10)")
+
+        if self._sargan_stat is not None:
+            print(f"\nSargan test: χ²={self._sargan_stat:.3f}  "
+                  f"p={self._sargan_pvalue:.3f}")
+
+        print(f"\n{'Variable':<20} {'Coef':<12} {'Std Err':<12} "
+              f"{'t':<8} {'P>|t|':<8} {'Type':<12}")
+        print("-" * 72)
+        for i, var in enumerate(self.X_cols):
+            vtype = "Endogenous" if var in self._endogenous_vars else "Exogenous"
+            if not np.isnan(self.std_errors_[i]):
+                print(f"{var:<20} {self.coefficients_[i]:<12.6f} "
+                      f"{self.std_errors_[i]:<12.6f} "
+                      f"{self.t_stats_[i]:<8.3f} {self.p_values_[i]:<8.3f} "
+                      f"{vtype:<12}")
+            else:
+                print(f"{var:<20} {self.coefficients_[i]:<12.6f} "
+                      f"{'N/A':<12} {'N/A':<8} {'N/A':<8} {vtype:<12}")
+
+        print("\nFixed Effects:")
+        print("-" * 60)
+        for fe_var in self.fe_vars:
+            c = self.fe_coefficients_[fe_var]
+            print(f"  {fe_var}: mean={np.mean(c):.4f}  std={np.std(c):.4f}  "
+                  f"min={np.min(c):.4f}  max={np.max(c):.4f}")
+        print("=" * 90)
+
+    def first_stage_results(self):
+        """Return first-stage regression details."""
         if not self._is_iv:
-            print("No IV diagnostics available (not an IV model)")
+            print("Not an IV model.")
             return None
-            
+        return {var: {
+            'coefficients': self._first_stage_models[var]['coefficients'],
+            'instrument_names': self._first_stage_models[var]['instrument_names'],
+            'r_squared': self._first_stage_r2[var],
+            'f_statistic': self._first_stage_f_stats[var],
+            'fitted_values': self._first_stage_fitted[var],
+            'residuals': self._first_stage_residuals[var],
+        } for var in self._endogenous_vars}
+
+    def iv_diagnostics(self):
+        """Return IV diagnostic test results."""
+        if not self._is_iv:
+            print("Not an IV model.")
+            return None
         return {
             'weak_instruments': self._weak_instruments,
-            'first_stage_f_stats': self._first_stage_f_stats,
+            'first_stage_f_stats': dict(self._first_stage_f_stats),
             'sargan_statistic': self._sargan_stat,
             'sargan_pvalue': self._sargan_pvalue,
-            'min_eigenvalue': None,  # Could add if needed
-            'effective_f': None      # Could add Olea-Pflueger if needed
         }
