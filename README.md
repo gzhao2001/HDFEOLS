@@ -13,7 +13,7 @@ Both classes live in [`HDFE.py`](HDFE.py). `HDFEIV` inherits from `HDFE` and fal
 
 1. **Demeaning** — Alternating projection over FE groups with Gearhart-Koshy (GK) acceleration.  GPU path uses CuPy `bincount`; CPU path uses NumPy.  Negative group indices (from NaN FE values) are masked out.
 2. **Coefficient estimation** — OLS on demeaned data (`HDFE`) or direct 2SLS formula $\beta = (X'P_Z X)^{-1} X'P_Z y$ with original $X$ (`HDFEIV`).
-3. **FE recovery** — Sparse `D'D` system solved via `spsolve` (GPU: `cupyx`).  When sample weights are active, the RHS is un-weighted before solving so FE coefficients are on the original scale.
+3. **FE recovery** — Sparse `D'D` system solved via `spsolve` (GPU: `cupyx`).  Since `spsolve` silently returns NaN on singular matrices (e.g. collinear FE dimensions or empty categories after NaN filtering), the solver detects NaN output and falls back to `scipy.sparse.linalg.lsqr` which returns the minimum-norm least-squares solution.  When sample weights are active, the RHS is un-weighted before solving so FE coefficients are on the original scale.
 4. **Standard errors** — Sandwich estimator with the appropriate bread/meat for each SE type.  IV models use the IV-specific variance formula $A^{-1} B A^{-1}$ where $A = X'Z(Z'Z)^{-1}Z'X$.
 
 
@@ -23,7 +23,6 @@ Both classes live in [`HDFE.py`](HDFE.py). `HDFEIV` inherits from `HDFE` and fal
 numpy
 pandas
 scipy
-scikit-learn      # LabelEncoder (encoding only)
 cupy              # optional — GPU acceleration
 ```
 
@@ -43,7 +42,7 @@ model = HDFE(
     max_iter=5000,       # max alternating-projection iterations
     tolerance=1e-8,      # convergence criterion (mean squared change)
     acceleration='gk',   # 'gk' (Gearhart-Koshy) or 'basic'
-    use_gpu=None,        # None = auto-detect, True/False to force
+    use_gpu=False,       # set True to use CuPy GPU acceleration
     verbose=False,
 )
 ```
@@ -91,7 +90,7 @@ model = HDFEIV(
     max_iter=5000,
     tolerance=1e-8,
     acceleration='gk',
-    use_gpu=None,
+    use_gpu=False,
     verbose=False,
 )
 ```

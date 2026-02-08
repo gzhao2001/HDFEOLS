@@ -1,19 +1,11 @@
 # HDFE.py
 # High-Dimensional Fixed Effects Estimators (CPU and GPU versions)
-import pandas as pd
 import numpy as np
+import pandas as pd
 from scipy import stats
-from matplotlib import pyplot as plt
-import time
-import psutil
-import pyfixest as pf
-import numba
-from numba import jit, prange
-from scipy.sparse import csr_matrix, csc_matrix, eye as speye
+from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import spsolve
-from sklearn.preprocessing import LabelEncoder
 import warnings
-import cupy as cp
 
 class HDFE:
     """
@@ -22,27 +14,26 @@ class HDFE:
     """
 
     def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk',
-                 use_gpu=None, verbose=False):
+                 use_gpu=False, verbose=False):
         self.max_iter = max_iter
         self.tolerance = tolerance
         self.acceleration = acceleration
         self.verbose = verbose
 
-        # GPU setup
-        if use_gpu is None:
+        # GPU setup — only attempt import when explicitly requested
+        if use_gpu:
             try:
                 import cupy as cp
                 self.use_gpu = cp.cuda.is_available()
-                if self.verbose and self.use_gpu:
-                    print("GPU detected and will be used")
-                elif self.verbose:
-                    print("GPU not available, using CPU")
+                if self.verbose:
+                    print("GPU detected and will be used" if self.use_gpu
+                          else "GPU not available, falling back to CPU")
             except ImportError:
                 self.use_gpu = False
                 if self.verbose:
-                    print("CuPy not installed, using CPU")
+                    print("CuPy not installed, falling back to CPU")
         else:
-            self.use_gpu = use_gpu
+            self.use_gpu = False
 
         # State
         self.fitted = False
@@ -313,6 +304,8 @@ class HDFE:
             sw_safe = np.where(sw > 0, sw, 1.0)
             rhs = rhs / sw_safe
 
+        from scipy.sparse.linalg import lsqr
+
         try:
             DtD = D.T @ D;  Dtr = D.T @ rhs
             if self.use_gpu:
@@ -327,8 +320,15 @@ class HDFE:
                     alpha = spsolve(DtD, Dtr)
             else:
                 alpha = spsolve(DtD, Dtr)
+
+            # spsolve silently returns NaN on singular matrices
+            # instead of raising — detect and fall back to lsqr
+            if not np.all(np.isfinite(alpha)):
+                if self.verbose:
+                    print("  spsolve returned NaN (singular D'D), "
+                          "falling back to lsqr...")
+                alpha = lsqr(D, rhs)[0]
         except Exception:
-            from scipy.sparse.linalg import lsqr
             alpha = lsqr(D, rhs)[0]
 
         fe_coefficients = {}
@@ -579,7 +579,7 @@ class HDFEIV(HDFE):
     """
 
     def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk',
-                 use_gpu=None, verbose=False):
+                 use_gpu=False, verbose=False):
         super().__init__(max_iter, tolerance, acceleration, use_gpu, verbose)
         self._reset_iv_state()
 
