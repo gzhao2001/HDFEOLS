@@ -7,6 +7,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import spsolve
 import warnings
 
+
 class HDFE:
     """
     High-Dimensional Fixed Effects estimator using alternating projection
@@ -14,11 +15,12 @@ class HDFE:
     """
 
     def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk',
-                 use_gpu=False, verbose=False):
+                 use_gpu=False, verbose=False, convergence_check_interval=5):
         self.max_iter = max_iter
         self.tolerance = tolerance
         self.acceleration = acceleration
         self.verbose = verbose
+        self.convergence_check_interval = convergence_check_interval
 
         # GPU setup — only attempt import when explicitly requested
         if use_gpu:
@@ -41,6 +43,7 @@ class HDFE:
         self.category_orders_ = {}
         self.category_to_index_ = {}
         self.n_categories = {}
+        self._rank_diagnostics = {}
 
     # ── Category encoding (vectorised) ──────────────────────────────────────
 
@@ -68,46 +71,106 @@ class HDFE:
                                     .astype(int).values)
         return encoded_data
 
-    # ── Group demeaning ─────────────────────────────────────────────────────
+    # ── Precomputed group info ──────────────────────────────────────────────
 
-    def _cpu_demean_by_group(self, data, group_indices, n_groups):
-        """CPU group demeaning (vectorised, negative-index safe)."""
+    def _precompute_group_info_cpu(self, group_indices, n_groups):
+        """Precompute per-FE constants once before the iteration loop."""
         valid = group_indices >= 0
         safe_idx = np.where(valid, group_indices, 0)
-        group_sums = np.bincount(
-            safe_idx,
-            weights=np.where(valid, data, 0.0),
-            minlength=n_groups).astype(np.float64)
         group_counts = np.bincount(
-            safe_idx,
-            weights=valid.astype(np.float64),
+            safe_idx, weights=valid.astype(np.float64),
             minlength=n_groups)
-        group_means = np.zeros(n_groups, dtype=np.float64)
+        inv_counts = np.zeros(n_groups, dtype=np.float64)
         nz = group_counts > 0
-        group_means[nz] = group_sums[nz] / group_counts[nz]
-        result = data.copy()
-        result[valid] = data[valid] - group_means[group_indices[valid]]
-        return result, group_means
+        inv_counts[nz] = 1.0 / group_counts[nz]
+        return {
+            'valid': valid,
+            'safe_idx': safe_idx,
+            'valid_idx': np.where(valid)[0],
+            'safe_valid': safe_idx[valid],
+            'inv_counts': inv_counts,
+            'n_groups': n_groups,
+        }
 
-    def _gpu_demean_by_group(self, data_gpu, group_indices_gpu, n_groups):
-        """GPU group demeaning (vectorised, negative-index safe — C6 fix)."""
+    def _precompute_group_info_gpu(self, group_indices_gpu, n_groups):
+        """Precompute per-FE constants once before the iteration loop (GPU)."""
         import cupy as cp
         valid = group_indices_gpu >= 0
         safe_idx = cp.where(valid, group_indices_gpu, cp.int32(0))
-        group_sums = cp.bincount(
-            safe_idx,
-            weights=cp.where(valid, data_gpu, 0.0),
-            minlength=n_groups).astype(cp.float64)
         group_counts = cp.bincount(
-            safe_idx,
-            weights=valid.astype(cp.float64),
+            safe_idx, weights=valid.astype(cp.float64),
             minlength=n_groups)
-        group_means = cp.zeros(n_groups, dtype=cp.float64)
+        inv_counts = cp.zeros(n_groups, dtype=cp.float64)
         nz = group_counts > 0
-        group_means[nz] = group_sums[nz] / group_counts[nz]
-        result = data_gpu.copy()
-        result[valid] = data_gpu[valid] - group_means[group_indices_gpu[valid]]
-        return result, group_means
+        inv_counts[nz] = 1.0 / group_counts[nz]
+        return {
+            'valid': valid,
+            'safe_idx': safe_idx,
+            'valid_idx': cp.where(valid)[0],
+            'safe_valid': safe_idx[valid],
+            'inv_counts': inv_counts,
+            'n_groups': n_groups,
+        }
+
+    # ── Batch group demeaning ───────────────────────────────────────────────
+
+    def _cpu_demean_batch(self, y, X, ginfo):
+        """Demean y (1-D) and X (2-D) by a single FE group. Returns new arrays."""
+        valid = ginfo['valid']
+        safe_idx = ginfo['safe_idx']
+        safe_valid = ginfo['safe_valid']
+        valid_idx = ginfo['valid_idx']
+        inv_counts = ginfo['inv_counts']
+        ng = ginfo['n_groups']
+
+        # y
+        y_sums = np.bincount(safe_idx,
+                             weights=np.where(valid, y, 0.0),
+                             minlength=ng).astype(np.float64)
+        y_means = y_sums * inv_counts
+        y_new = y.copy()
+        y_new[valid_idx] -= y_means[safe_valid]
+
+        # X — all columns at once via loop over bincount (avoids 2-D scatter)
+        n_cols = X.shape[1]
+        X_new = X.copy()
+        X_valid = X[valid_idx]
+        for j in range(n_cols):
+            col_sums = np.bincount(safe_valid,
+                                   weights=X_valid[:, j],
+                                   minlength=ng).astype(np.float64)
+            X_new[valid_idx, j] -= (col_sums * inv_counts)[safe_valid]
+
+        return y_new, X_new
+
+    def _gpu_demean_batch(self, y, X, ginfo):
+        """Demean y (1-D) and X (2-D) by a single FE group (GPU).
+        Uses scatter_add for all columns at once. Returns new arrays."""
+        import cupy as cp
+        valid = ginfo['valid']
+        safe_idx = ginfo['safe_idx']
+        safe_valid = ginfo['safe_valid']
+        valid_idx = ginfo['valid_idx']
+        inv_counts = ginfo['inv_counts']
+        ng = ginfo['n_groups']
+
+        # y
+        y_sums = cp.bincount(safe_idx,
+                             weights=cp.where(valid, y, 0.0),
+                             minlength=ng).astype(cp.float64)
+        y_means = y_sums * inv_counts
+        y_new = y.copy()
+        y_new[valid_idx] -= y_means[safe_valid]
+
+        # X — all columns via scatter_add
+        n_cols = X.shape[1]
+        group_sums = cp.zeros((ng, n_cols), dtype=cp.float64)
+        cp.add.at(group_sums, safe_valid, X[valid_idx])
+        group_means = group_sums * inv_counts.reshape(-1, 1)
+        X_new = X.copy()
+        X_new[valid_idx] -= group_means[safe_valid]
+
+        return y_new, X_new
 
     # ── Alternating projection ──────────────────────────────────────────────
 
@@ -128,7 +191,11 @@ class HDFE:
                 group_ids_list = [
                     cp.asarray(encoded_data[fv].values, dtype=cp.int32)
                     for fv in fe_vars]
-                demean_func = self._gpu_demean_by_group
+                # Precompute group info once
+                group_infos = [
+                    self._precompute_group_info_gpu(gids, self.n_categories[fv])
+                    for gids, fv in zip(group_ids_list, fe_vars)]
+                demean_batch = self._gpu_demean_batch
                 backend_name = "GPU"
             except Exception as e:
                 if self.verbose:
@@ -139,7 +206,11 @@ class HDFE:
             y_proj = y.copy()
             X_proj = X.copy()
             group_ids_list = [encoded_data[fv].values for fv in fe_vars]
-            demean_func = self._cpu_demean_by_group
+            # Precompute group info once
+            group_infos = [
+                self._precompute_group_info_cpu(gids, self.n_categories[fv])
+                for gids, fv in zip(group_ids_list, fe_vars)]
+            demean_batch = self._cpu_demean_batch
             backend_name = "CPU"
 
         if self.verbose:
@@ -147,35 +218,39 @@ class HDFE:
 
         if self.acceleration == 'gk':
             return self._alternating_projection_gk(
-                y_proj, X_proj, group_ids_list, fe_vars, demean_func)
+                y_proj, X_proj, group_infos, demean_batch)
         else:
             return self._alternating_projection_basic(
-                y_proj, X_proj, group_ids_list, fe_vars, demean_func)
+                y_proj, X_proj, group_infos, demean_batch)
 
-    def _alternating_projection_basic(self, y_proj, X_proj, group_ids_list,
-                                       fe_vars, demean_func):
+    def _alternating_projection_basic(self, y_proj, X_proj, group_infos,
+                                       demean_batch):
+        check_iv = self.convergence_check_interval
         for iteration in range(self.max_iter):
-            y_old = y_proj.copy()
-            X_old = X_proj.copy()
-            for idx, fe_var in enumerate(fe_vars):
-                gids = group_ids_list[idx]
-                ng = self.n_categories[fe_var]
-                y_proj, _ = demean_func(y_proj, gids, ng)
-                for j in range(X_proj.shape[1]):
-                    X_proj[:, j], _ = demean_func(X_proj[:, j], gids, ng)
-            if self.use_gpu:
-                import cupy as cp
-                y_chg = float(cp.mean((y_proj - y_old)**2))
-                X_chg = float(cp.mean((X_proj - X_old)**2))
-            else:
-                y_chg = np.mean((y_proj - y_old)**2)
-                X_chg = np.mean((X_proj - X_old)**2)
-            if self.verbose and iteration % 200 == 0:
-                print(f"  iter {iteration}: y_chg={y_chg:.2e}, X_chg={X_chg:.2e}")
-            if y_chg < self.tolerance and X_chg < self.tolerance:
-                if self.verbose:
-                    print(f"  Converged after {iteration+1} iterations")
-                break
+            # Only snapshot + check periodically
+            do_check = (iteration % check_iv == 0) or (iteration == self.max_iter - 1)
+            if do_check:
+                y_old = y_proj.copy()
+                X_old = X_proj.copy()
+
+            # Batch demean y + all X columns per FE
+            for ginfo in group_infos:
+                y_proj, X_proj = demean_batch(y_proj, X_proj, ginfo)
+
+            if do_check:
+                if self.use_gpu:
+                    import cupy as cp
+                    y_chg = float(cp.mean((y_proj - y_old)**2))
+                    X_chg = float(cp.mean((X_proj - X_old)**2))
+                else:
+                    y_chg = np.mean((y_proj - y_old)**2)
+                    X_chg = np.mean((X_proj - X_old)**2)
+                if self.verbose and iteration % 200 == 0:
+                    print(f"  iter {iteration}: y_chg={y_chg:.2e}, X_chg={X_chg:.2e}")
+                if y_chg < self.tolerance and X_chg < self.tolerance:
+                    if self.verbose:
+                        print(f"  Converged after {iteration+1} iterations")
+                    break
         else:
             if self.verbose:
                 print(f"  Warning: max iterations ({self.max_iter}) reached")
@@ -184,25 +259,31 @@ class HDFE:
             return cp.asnumpy(y_proj), cp.asnumpy(X_proj)
         return y_proj, X_proj
 
-    def _alternating_projection_gk(self, y_proj, X_proj, group_ids_list,
-                                    fe_vars, demean_func):
+    def _alternating_projection_gk(self, y_proj, X_proj, group_infos,
+                                    demean_batch):
+        check_iv = self.convergence_check_interval
         y_hist, X_hist = [], []
         for iteration in range(self.max_iter):
-            y_old = y_proj.copy()
-            X_old = X_proj.copy()
-            for idx, fe_var in enumerate(fe_vars):
-                gids = group_ids_list[idx]
-                ng = self.n_categories[fe_var]
-                y_proj, _ = demean_func(y_proj, gids, ng)
-                for j in range(X_proj.shape[1]):
-                    X_proj[:, j], _ = demean_func(X_proj[:, j], gids, ng)
-            if self.use_gpu:
-                import cupy as cp
-                y_chg = float(cp.mean((y_proj - y_old)**2))
-                X_chg = float(cp.mean((X_proj - X_old)**2))
-            else:
-                y_chg = np.mean((y_proj - y_old)**2)
-                X_chg = np.mean((X_proj - X_old)**2)
+            do_check = (iteration % check_iv == 0) or (iteration == self.max_iter - 1)
+            if do_check:
+                y_old = y_proj.copy()
+                X_old = X_proj.copy()
+
+            # Batch demean y + all X columns per FE
+            for ginfo in group_infos:
+                y_proj, X_proj = demean_batch(y_proj, X_proj, ginfo)
+
+            # Convergence check only periodically
+            if do_check:
+                if self.use_gpu:
+                    import cupy as cp
+                    y_chg = float(cp.mean((y_proj - y_old)**2))
+                    X_chg = float(cp.mean((X_proj - X_old)**2))
+                else:
+                    y_chg = np.mean((y_proj - y_old)**2)
+                    X_chg = np.mean((X_proj - X_old)**2)
+
+            # GK acceleration
             if len(y_hist) >= 2:
                 y_proj = self._apply_gk_acceleration(
                     y_proj, y_hist[-1], y_hist[-2])
@@ -212,12 +293,14 @@ class HDFE:
             X_hist.append(X_proj.copy())
             if len(y_hist) > 3:
                 y_hist.pop(0); X_hist.pop(0)
-            if self.verbose and iteration % 200 == 0:
-                print(f"  iter {iteration}: y_chg={y_chg:.2e}, X_chg={X_chg:.2e}")
-            if y_chg < self.tolerance and X_chg < self.tolerance:
-                if self.verbose:
-                    print(f"  Converged after {iteration+1} iterations")
-                break
+
+            if do_check:
+                if self.verbose and iteration % 200 == 0:
+                    print(f"  iter {iteration}: y_chg={y_chg:.2e}, X_chg={X_chg:.2e}")
+                if y_chg < self.tolerance and X_chg < self.tolerance:
+                    if self.verbose:
+                        print(f"  Converged after {iteration+1} iterations")
+                    break
         else:
             if self.verbose:
                 print(f"  Warning: max iterations ({self.max_iter}) reached")
@@ -248,7 +331,7 @@ class HDFE:
 
     def _build_dummy_matrix(self, encoded_data, fe_vars):
         """Build sparse dummy matrix for FE recovery (vectorised)."""
-        if len(fe_vars) == 0:                                   # H2
+        if len(fe_vars) == 0:
             raise ValueError("fe_vars must be non-empty for dummy matrix construction")
         n_obs = len(encoded_data)
         total_cols = self.n_categories[fe_vars[0]]
@@ -286,8 +369,9 @@ class HDFE:
 
     def _recover_fixed_effects(self, y, X, encoded_data, beta,
                                 y_projected, X_projected,
-                                sample_weight=None):
-        """Recover FE coefficients using sparse solver (C7: weight-aware)."""
+                                sample_weight=None,
+                                singular_fallback='lsqr'):
+        """Recover FE coefficients using sparse solver (weight-aware)."""
         if self.verbose:
             print("Recovering fixed effects using sparse solver...")
         if len(self.fe_vars) == 0:
@@ -298,7 +382,7 @@ class HDFE:
         res_proj = y_projected - X_projected @ beta
         rhs = res_orig - res_proj
 
-        # C7: undo sqrt-weighting so FE recovery is in the original scale
+        # Undo sqrt-weighting so FE recovery is in the original scale
         if sample_weight is not None:
             sw = np.sqrt(sample_weight)
             sw_safe = np.where(sw > 0, sw, 1.0)
@@ -306,30 +390,90 @@ class HDFE:
 
         from scipy.sparse.linalg import lsqr
 
+        # Prune columns with zero observations (empty categories)
+        DtD = D.T @ D
+        diag_DtD = np.array(DtD.diagonal()).ravel()
+        empty_cols = np.where(diag_DtD == 0)[0]
+
+        if len(empty_cols) > 0:
+            empty_fe_info = {}
+            for fv in self.fe_vars:
+                info = fe_col_info[fv]
+                fe_empty = [c for c in empty_cols
+                            if info['start_col'] <= c < info['end_col']]
+                if fe_empty:
+                    empty_fe_info[fv] = len(fe_empty)
+
+            self._rank_diagnostics['empty_fe_categories'] = empty_fe_info
+            msg = (f"D'D has {len(empty_cols)} zero-diagonal entries "
+                   f"(empty FE categories): {empty_fe_info}")
+            if singular_fallback == 'raise':
+                raise np.linalg.LinAlgError(
+                    msg + ". Set singular_fallback='lsqr' to use "
+                    "least-squares fallback.")
+
+            if self.verbose:
+                print(f"  ⚠️ {msg}, pruning before solve...")
+            keep_cols = np.where(diag_DtD > 0)[0]
+            D_pruned = D[:, keep_cols]
+            DtD = D_pruned.T @ D_pruned
+            Dtr = D_pruned.T @ rhs
+        else:
+            Dtr = D.T @ rhs
+            keep_cols = None
+
         try:
-            DtD = D.T @ D;  Dtr = D.T @ rhs
             if self.use_gpu:
                 try:
                     import cupy as cp
                     import cupyx.scipy.sparse as csp
                     import cupyx.scipy.sparse.linalg as cspl
-                    alpha = cp.asnumpy(cspl.spsolve(
+                    alpha_solve = cp.asnumpy(cspl.spsolve(
                         csp.csr_matrix(DtD.astype(np.float64)),
                         cp.asarray(Dtr.astype(np.float64))))
                 except Exception:
-                    alpha = spsolve(DtD, Dtr)
+                    alpha_solve = spsolve(DtD, Dtr)
             else:
-                alpha = spsolve(DtD, Dtr)
+                alpha_solve = spsolve(DtD, Dtr)
 
             # spsolve silently returns NaN on singular matrices
-            # instead of raising — detect and fall back to lsqr
-            if not np.all(np.isfinite(alpha)):
+            if not np.all(np.isfinite(alpha_solve)):
+                msg = ("spsolve returned NaN — D'D is singular "
+                       "(collinear fixed effects)")
+                self._rank_diagnostics['spsolve_nan'] = True
+                if singular_fallback == 'raise':
+                    raise np.linalg.LinAlgError(
+                        msg + ". Set singular_fallback='lsqr' to use "
+                        "least-squares fallback.")
                 if self.verbose:
-                    print("  spsolve returned NaN (singular D'D), "
-                          "falling back to lsqr...")
-                alpha = lsqr(D, rhs)[0]
+                    print(f"  ⚠️ {msg}, falling back to lsqr...")
+                if keep_cols is not None:
+                    alpha_solve = lsqr(D_pruned, rhs)[0]
+                else:
+                    alpha_solve = lsqr(D, rhs)[0]
+
+        except np.linalg.LinAlgError:
+            raise  # re-raise our own LinAlgError
         except Exception:
-            alpha = lsqr(D, rhs)[0]
+            msg = "D'D solve failed"
+            self._rank_diagnostics['solve_exception'] = True
+            if singular_fallback == 'raise':
+                raise np.linalg.LinAlgError(
+                    msg + ". Set singular_fallback='lsqr' to use "
+                    "least-squares fallback.")
+            if self.verbose:
+                print(f"  ⚠️ {msg}, falling back to lsqr...")
+            if keep_cols is not None:
+                alpha_solve = lsqr(D_pruned, rhs)[0]
+            else:
+                alpha_solve = lsqr(D, rhs)[0]
+
+        # Re-insert zeros for pruned columns
+        if keep_cols is not None:
+            alpha = np.zeros(D.shape[1])
+            alpha[keep_cols] = alpha_solve
+        else:
+            alpha = alpha_solve
 
         fe_coefficients = {}
         for fe_idx, fv in enumerate(self.fe_vars):
@@ -349,7 +493,11 @@ class HDFE:
     # ── Main fit ────────────────────────────────────────────────────────────
 
     def fit(self, data, y_col, X_cols, fe_vars,
-            se_type='homoscedastic', cluster_vars=None, sample_weight=None):
+            se_type='homoscedastic', cluster_vars=None, sample_weight=None,
+            singular_fallback='lsqr'):
+        if singular_fallback not in ('lsqr', 'raise'):
+            raise ValueError("singular_fallback must be 'lsqr' or 'raise'")
+        self._rank_diagnostics = {}
         valid_se_types = ['homoscedastic', 'hc1', 'hc2', 'hc3', 'cluster']
         if se_type not in valid_se_types:
             raise ValueError(f"se_type must be one of {valid_se_types}")
@@ -357,7 +505,7 @@ class HDFE:
             raise ValueError("cluster_vars required when se_type='cluster'")
         if se_type == 'cluster' and not isinstance(cluster_vars, list):
             cluster_vars = [cluster_vars]
-        if not fe_vars:                                         # H2
+        if not fe_vars:
             raise ValueError("fe_vars must be non-empty for HDFE estimation")
 
         self.se_type = se_type
@@ -378,7 +526,6 @@ class HDFE:
         y = data[y_col].values.astype(np.float64)
         X = data[X_cols].values.astype(np.float64)
         valid_mask = ~(np.isnan(y) | np.any(np.isnan(X), axis=1))
-        # H-REMAIN-1: exclude rows with NaN in FE columns
         for fv in fe_vars:
             valid_mask &= data[fv].notna().values
         y = y[valid_mask]; X = X[valid_mask]
@@ -392,12 +539,20 @@ class HDFE:
             X = X * np.sqrt(sample_weight).reshape(-1, 1)
 
         y_proj, X_proj = self._alternating_projection(y, X, encoded_data, fe_vars)
-        self.coefficients_ = np.linalg.solve(
-            X_proj.T @ X_proj, X_proj.T @ y_proj)
-        # C7: pass weights for correct FE recovery
+        try:
+            self.coefficients_ = np.linalg.solve(
+                X_proj.T @ X_proj, X_proj.T @ y_proj)
+        except np.linalg.LinAlgError:
+            self._rank_diagnostics['XtX_singular'] = True
+            warnings.warn(
+                "X'X is singular after projection — using least-squares "
+                "solution. Check for collinear regressors.", stacklevel=2)
+            self.coefficients_, _, _, _ = np.linalg.lstsq(
+                X_proj, y_proj, rcond=None)
         self.fe_coefficients_ = self._recover_fixed_effects(
             y, X, encoded_data, self.coefficients_, y_proj, X_proj,
-            sample_weight=self._sample_weight)
+            sample_weight=self._sample_weight,
+            singular_fallback=singular_fallback)
         self.X_projected = X_proj
         self.y_projected = y_proj
         self._calculate_statistics(
@@ -503,7 +658,7 @@ class HDFE:
         rss = np.sum(resid**2)
         self.r_squared_ = 1 - rss / tss
 
-        # dof (H3 warning if dangerously low)
+        # dof
         if len(self.fe_vars) > 0:
             df_abs = self.n_categories[self.fe_vars[0]]
             for fv in self.fe_vars[1:]:
@@ -536,6 +691,14 @@ class HDFE:
                 self.t_stats_ = np.full_like(self.coefficients_, np.nan)
                 self.p_values_ = np.full_like(self.coefficients_, np.nan)
 
+    # ── Rank diagnostics ────────────────────────────────────────────────────
+
+    def rank_diagnostics(self):
+        """Return rank diagnostic information from the last fit."""
+        if not self.fitted:
+            raise ValueError("Model must be fitted before rank diagnostics")
+        return dict(self._rank_diagnostics)
+
     # ── Summary ─────────────────────────────────────────────────────────────
 
     def summary(self):
@@ -566,8 +729,11 @@ class HDFE:
             print(f"  {fv}: mean={np.mean(c):.4f}, std={np.std(c):.4f}, "
                   f"min={np.min(c):.4f}, max={np.max(c):.4f}")
 
+        if self._rank_diagnostics:
+            print("\n⚠️  Rank Diagnostics:")
+            for key, val in self._rank_diagnostics.items():
+                print(f"  {key}: {val}")
         print("=" * 80)
-
 
 
 class HDFEIV(HDFE):
@@ -612,7 +778,7 @@ class HDFEIV(HDFE):
 
     def fit(self, data, y_col, X_cols, fe_vars, se_type='homoscedastic',
             cluster_vars=None, sample_weight=None, instruments=None,
-            endogenous_vars=None):
+            endogenous_vars=None, singular_fallback='lsqr'):
         """
         Fit HDFE-IV model with optional instrumental variables.
 
@@ -620,16 +786,20 @@ class HDFEIV(HDFE):
         ----------
         data : DataFrame
         y_col : str
-        X_cols : list – continuous variables (exogenous + endogenous)
-        fe_vars : list – fixed-effect variables
-        se_type : str – 'homoscedastic', 'hc1', 'cluster'
+        X_cols : list -- continuous variables (exogenous + endogenous)
+        fe_vars : list -- fixed-effect variables
+        se_type : str -- 'homoscedastic', 'hc1', 'cluster'
                         (hc2/hc3 not supported for IV)
         cluster_vars : list, optional
         sample_weight : array-like, optional
-        instruments : list, optional – excluded instrument column names
-        endogenous_vars : list, optional – subset of X_cols
+        instruments : list, optional -- excluded instrument column names
+        endogenous_vars : list, optional -- subset of X_cols
+        singular_fallback : str -- 'lsqr' (default) or 'raise'
         """
         self._reset_iv_state()
+        if singular_fallback not in ('lsqr', 'raise'):
+            raise ValueError("singular_fallback must be 'lsqr' or 'raise'")
+        self._rank_diagnostics = {}
 
         self._instruments = instruments
         self._endogenous_vars = endogenous_vars if endogenous_vars else []
@@ -640,7 +810,8 @@ class HDFEIV(HDFE):
             if self.verbose:
                 print("No instruments provided, running standard HDFE estimation...")
             return super().fit(data, y_col, X_cols, fe_vars, se_type,
-                               cluster_vars, sample_weight)
+                               cluster_vars, sample_weight,
+                               singular_fallback=singular_fallback)
 
         if se_type in ('hc2', 'hc3'):
             raise NotImplementedError(
@@ -660,7 +831,7 @@ class HDFEIV(HDFE):
             raise ValueError("cluster_vars must be specified when se_type='cluster'")
         if se_type == 'cluster' and not isinstance(cluster_vars, list):
             cluster_vars = [cluster_vars]
-        if not fe_vars:                                         # H2
+        if not fe_vars:
             raise ValueError("fe_vars must be non-empty for HDFE estimation")
 
         self._exogenous_vars = [x for x in X_cols if x not in endogenous_vars]
@@ -688,7 +859,6 @@ class HDFEIV(HDFE):
 
         valid_mask = ~(np.isnan(y) | np.any(np.isnan(X), axis=1)
                        | np.any(np.isnan(Z), axis=1))
-        # H-REMAIN-1: exclude rows with NaN in FE columns
         for fv in fe_vars:
             valid_mask &= data[fv].notna().values
         y = y[valid_mask]
@@ -724,10 +894,11 @@ class HDFEIV(HDFE):
             print("  Second stage 2SLS...")
         self._run_second_stage(y_demeaned, X_demeaned)
 
-        # Recover fixed effects (C7: pass weights)
+        # Recover fixed effects
         self.fe_coefficients_ = self._recover_fixed_effects(
             y, X, encoded_data, self.coefficients_, y_demeaned, X_demeaned,
-            sample_weight=self._sample_weight)
+            sample_weight=self._sample_weight,
+            singular_fallback=singular_fallback)
 
         self.X_projected = X_demeaned
         self.y_projected = y_demeaned
@@ -741,7 +912,6 @@ class HDFEIV(HDFE):
             df_absorbed = 0
         self._df_resid = max(len(y) - X.shape[1] - df_absorbed, 1)
 
-        # H3: warn when residual dof is dangerously low
         if self._df_resid <= X.shape[1]:
             warnings.warn(
                 f"Very low residual degrees of freedom ({self._df_resid}). "
@@ -801,14 +971,39 @@ class HDFEIV(HDFE):
 
                 # Partial F-stat for *excluded* instruments only
                 if len(exog_indices) > 0:
-                    pi_restricted = np.linalg.solve(
-                        X_exog.T @ X_exog, X_exog.T @ X_endog)
-                    rss_restricted = np.sum(
-                        (X_endog - X_exog @ pi_restricted)**2)
-                    q = Z_demeaned.shape[1]
-                    n_obs = len(X_endog)
-                    k_full = Z_full.shape[1]
-                    f_stat = ((rss_restricted - rss) / q) / (rss / (n_obs - k_full))
+                    # Guard 1: rank check before solve (solve on near-singular
+                    # matrices returns finite garbage instead of raising)
+                    if np.linalg.matrix_rank(X_exog) < X_exog.shape[1]:
+                        f_stat = np.nan
+                        self._rank_diagnostics[
+                            'first_stage_restricted_singular'] = True
+                        if self.verbose:
+                            print(f"    ⚠️ X_exog rank-deficient for "
+                                  f"{endog_var}, partial F-stat unavailable")
+                    else:
+                        try:
+                            pi_restricted = np.linalg.solve(
+                                X_exog.T @ X_exog, X_exog.T @ X_endog)
+                            if not np.all(np.isfinite(pi_restricted)):
+                                raise np.linalg.LinAlgError(
+                                    "Non-finite restricted coefficients")
+                            rss_restricted = np.sum(
+                                (X_endog - X_exog @ pi_restricted)**2)
+                            q = Z_demeaned.shape[1]
+                            n_obs = len(X_endog)
+                            k_full = Z_full.shape[1]
+                            f_stat = (((rss_restricted - rss) / q)
+                                      / (rss / (n_obs - k_full)))
+                            if not np.isfinite(f_stat):
+                                raise np.linalg.LinAlgError(
+                                    "Non-finite F-stat")
+                        except np.linalg.LinAlgError:
+                            f_stat = np.nan
+                            self._rank_diagnostics[
+                                'first_stage_restricted_singular'] = True
+                            if self.verbose:
+                                print(f"    ⚠️ X_exog singular for "
+                                      f"{endog_var}, partial F unavailable")
                 else:
                     n_obs = len(X_endog)
                     k = Z_demeaned.shape[1]
@@ -817,7 +1012,8 @@ class HDFEIV(HDFE):
                 self._first_stage_f_stats[endog_var] = f_stat
 
                 if self.verbose:
-                    print(f"    {endog_var}: R²={r2:.4f}, partial-F={f_stat:.2f}")
+                    print(f"    {endog_var}: R²={r2:.4f}, "
+                          f"partial-F={f_stat:.2f}")
 
             except np.linalg.LinAlgError:
                 raise ValueError(
@@ -830,14 +1026,26 @@ class HDFEIV(HDFE):
         """
         2SLS with original X_demeaned (not X_2sls with fitted values).
 
-        β = (X'Z (Z'Z)^{-1} Z'X)^{-1}  X'Z (Z'Z)^{-1} Z'y
+        beta = (X'Z (Z'Z)^{-1} Z'X)^{-1}  X'Z (Z'Z)^{-1} Z'y
         """
         Z = self._Z_full
 
-        self._tZX    = Z.T @ X_demeaned
-        self._tXZ    = X_demeaned.T @ Z
-        self._tZy    = Z.T @ y_demeaned
-        self._tZZinv = np.linalg.inv(Z.T @ Z)
+        self._tZX  = Z.T @ X_demeaned
+        self._tXZ  = X_demeaned.T @ Z
+        self._tZy  = Z.T @ y_demeaned
+
+        # Guard 2: Z'Z inversion with NaN/Inf check
+        try:
+            self._tZZinv = np.linalg.inv(Z.T @ Z)
+            if not np.all(np.isfinite(self._tZZinv)):
+                raise np.linalg.LinAlgError(
+                    "Non-finite Z'Z inverse")
+        except np.linalg.LinAlgError:
+            self._rank_diagnostics['ZtZ_singular'] = True
+            raise ValueError(
+                "Z'Z is singular — instruments (including exogenous "
+                "regressors) are collinear. Check for multicollinearity "
+                "in the instrument set.")
 
         try:
             H = self._tXZ @ self._tZZinv
@@ -847,8 +1055,9 @@ class HDFEIV(HDFE):
             if self.verbose:
                 print("    2SLS coefficients computed.")
         except np.linalg.LinAlgError:
+            self._rank_diagnostics['2sls_A_singular'] = True
             raise ValueError(
-                "2SLS estimation failed – check for identification issues.")
+                "2SLS estimation failed — check for identification issues.")
 
     # ── IV standard errors ──────────────────────────────────────────────────
 
@@ -857,13 +1066,23 @@ class HDFEIV(HDFE):
         """
         IV-robust standard errors using the correct sandwich formula.
 
-        Var(β) = A^{-1} B A^{-1}
-        where A = X'Z(Z'Z)^{-1}Z'X
-        and B depends on se_type.
+        Var(beta) = A^{-1} B A^{-1}
+        where A = X'Z(Z'Z)^{-1}Z'X  and  B depends on se_type.
         """
         Z = self._Z_full
         A = self._tXZ @ self._tZZinv @ self._tZX
-        A_inv = np.linalg.inv(A)
+
+        # Guard 3: A inversion with NaN/Inf check
+        try:
+            A_inv = np.linalg.inv(A)
+            if not np.all(np.isfinite(A_inv)):
+                raise np.linalg.LinAlgError(
+                    "Non-finite A inverse")
+        except np.linalg.LinAlgError:
+            self._rank_diagnostics['iv_se_A_singular'] = True
+            raise np.linalg.LinAlgError(
+                "X'Z(Z'Z)⁻¹Z'X is singular — cannot compute "
+                "IV standard errors")
 
         if self.se_type == 'homoscedastic':
             sigma2 = np.sum(residuals**2) / self._df_resid
@@ -957,7 +1176,6 @@ class HDFEIV(HDFE):
             print(f"    Min first-stage partial-F: {min_f:.2f}"
                   f"{'  ⚠️ weak' if self._weak_instruments else '  ✅ ok'}")
         n_excl = len(self._instruments)
-        n_excl = len(self._instruments)
         n_endog = len(self._endogenous_vars)
 
         if n_excl > n_endog:
@@ -1012,8 +1230,10 @@ class HDFEIV(HDFE):
         print("\nFirst Stage:")
         print("-" * 60)
         for var in self._endogenous_vars:
+            f_val = self._first_stage_f_stats[var]
+            f_str = f"{f_val:.2f}" if np.isfinite(f_val) else "N/A (singular)"
             print(f"  {var}: R²={self._first_stage_r2[var]:.4f}  "
-                  f"partial-F={self._first_stage_f_stats[var]:.2f}")
+                  f"partial-F={f_str}")
         if self._weak_instruments:
             print("  ⚠️  Weak instruments (F < 10)")
 
@@ -1041,6 +1261,10 @@ class HDFEIV(HDFE):
             c = self.fe_coefficients_[fe_var]
             print(f"  {fe_var}: mean={np.mean(c):.4f}  std={np.std(c):.4f}  "
                   f"min={np.min(c):.4f}  max={np.max(c):.4f}")
+        if self._rank_diagnostics:
+            print("\n⚠️  Rank Diagnostics:")
+            for key, val in self._rank_diagnostics.items():
+                print(f"  {key}: {val}")
         print("=" * 90)
 
     def first_stage_results(self):

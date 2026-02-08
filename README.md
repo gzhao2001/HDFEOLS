@@ -11,10 +11,15 @@ Both classes live in [`HDFE.py`](HDFE.py). `HDFEIV` inherits from `HDFE` and fal
 
 ### Algorithm
 
-1. **Demeaning** — Alternating projection over FE groups with Gearhart-Koshy (GK) acceleration.  GPU path uses CuPy `bincount`; CPU path uses NumPy.  Negative group indices (from NaN FE values) are masked out.
-2. **Coefficient estimation** — OLS on demeaned data (`HDFE`) or direct 2SLS formula $\beta = (X'P_Z X)^{-1} X'P_Z y$ with original $X$ (`HDFEIV`).
-3. **FE recovery** — Sparse `D'D` system solved via `spsolve` (GPU: `cupyx`).  Since `spsolve` silently returns NaN on singular matrices (e.g. collinear FE dimensions or empty categories after NaN filtering), the solver detects NaN output and falls back to `scipy.sparse.linalg.lsqr` which returns the minimum-norm least-squares solution.  When sample weights are active, the RHS is un-weighted before solving so FE coefficients are on the original scale.
+1. **Demeaning** — Alternating projection over FE groups with Gearhart-Koshy (GK) acceleration.  Per-FE group constants (valid masks, inverse counts) are **precomputed once** before the iteration loop.  Each iteration batch-demeans $y$ and all $X$ columns together per FE group (avoiding per-column loops).  Convergence is checked every `convergence_check_interval` iterations (default 5), reducing snapshot overhead.  GPU path uses CuPy `bincount`/`scatter_add`; CPU path uses NumPy `bincount`.
+2. **Coefficient estimation** — OLS on demeaned data (`HDFE`) or direct 2SLS formula $\beta = (X'P_Z X)^{-1} X'P_Z y$ with original $X$ (`HDFEIV`).  If $X'X$ is singular after projection, falls back to `lstsq` with a warning.
+3. **FE recovery** — Sparse `D'D` system solved via `spsolve` (GPU: `cupyx`).  **Empty FE categories** (zero-diagonal entries in $D'D$) are pruned before solving.  Since `spsolve` silently returns NaN on singular matrices, the solver detects NaN output and falls back to `scipy.sparse.linalg.lsqr` (minimum-norm least-squares solution).  Set `singular_fallback='raise'` to get an exception instead.  When sample weights are active, the RHS is un-weighted before solving so FE coefficients are on the original scale.
 4. **Standard errors** — Sandwich estimator with the appropriate bread/meat for each SE type.  IV models use the IV-specific variance formula $A^{-1} B A^{-1}$ where $A = X'Z(Z'Z)^{-1}Z'X$.
+5. **IV singularity guards** — Three guards protect the HDFE-IV pipeline:
+   - *Guard 1 (first-stage restricted F-stat):* `matrix_rank` pre-check on $X_{exog}$ + `isfinite` post-check.
+   - *Guard 2 (Z'Z inversion):* try/except + `isfinite` post-check on $(Z'Z)^{-1}$.
+   - *Guard 3 (A inversion for SE):* try/except + `isfinite` post-check on $A^{-1}$.
+   All guards log to `rank_diagnostics()` and either fall back gracefully or raise with a clear message.
 
 
 ## Requirements
@@ -44,10 +49,11 @@ model = HDFE(
     acceleration='gk',   # 'gk' (Gearhart-Koshy) or 'basic'
     use_gpu=False,       # set True to use CuPy GPU acceleration
     verbose=False,
+    convergence_check_interval=5,  # check convergence every N iterations
 )
 ```
 
-#### `.fit(data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None, sample_weight=None)`
+#### `.fit(data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None, sample_weight=None, singular_fallback='lsqr')`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -58,12 +64,28 @@ model = HDFE(
 | `se_type` | str | `'homoscedastic'`, `'hc1'`, `'hc2'`, `'hc3'`, or `'cluster'` |
 | `cluster_vars` | list[str] | Cluster variable(s); required when `se_type='cluster'` |
 | `sample_weight` | array | Per-observation weights (WLS); applied as √w scaling |
+| `singular_fallback` | str | `'lsqr'` (default) — use least-squares fallback on singular systems; `'raise'` — raise `LinAlgError` instead |
 
 Returns `self`.
 
 #### `.summary()`
 
-Prints coefficients, SEs, t-stats, p-values, R², and FE summary statistics.
+Prints coefficients, SEs, t-stats, p-values, R², FE summary statistics, and any rank diagnostics warnings.
+
+#### `.rank_diagnostics()`
+
+Returns a `dict` of rank/singularity diagnostic information from the last `.fit()` call.  Empty dict when no issues were detected.  Possible keys:
+
+| Key | Meaning |
+|---|---|
+| `XtX_singular` | $X'X$ was singular after demeaning; `lstsq` fallback used |
+| `empty_fe_categories` | Dict of FE vars with empty categories that were pruned |
+| `spsolve_nan` | `spsolve` returned NaN; `lsqr` fallback used |
+| `solve_exception` | `spsolve` raised an exception; `lsqr` fallback used |
+| `first_stage_restricted_singular` | Restricted first-stage regression singular (IV only) |
+| `ZtZ_singular` | $Z'Z$ is singular — collinear instruments (IV only) |
+| `2sls_A_singular` | 2SLS projection matrix singular (IV only) |
+| `iv_se_A_singular` | IV SE matrix singular (IV only) |
 
 #### Attributes (after `.fit()`)
 
@@ -97,7 +119,7 @@ model = HDFEIV(
 
 Inherits all `HDFE` constructor parameters.
 
-#### `.fit(data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None, sample_weight=None, instruments=None, endogenous_vars=None)`
+#### `.fit(data, y_col, X_cols, fe_vars, se_type='homoscedastic', cluster_vars=None, sample_weight=None, instruments=None, endogenous_vars=None, singular_fallback='lsqr')`
 
 All `HDFE.fit()` parameters plus:
 
@@ -105,6 +127,7 @@ All `HDFE.fit()` parameters plus:
 |---|---|---|
 | `instruments` | list[str] | Excluded instrument columns |
 | `endogenous_vars` | list[str] | Endogenous variables (must be a subset of `X_cols`) |
+| `singular_fallback` | str | `'lsqr'` (default) — use least-squares fallback; `'raise'` — raise `LinAlgError` |
 
 When `instruments` or `endogenous_vars` is `None`/empty, falls back to standard HDFE-OLS.
 
@@ -146,7 +169,11 @@ Returns a dict keyed by endogenous variable name:
 
 #### `.summary()`
 
-Prints second-stage results, first-stage F-stats, Sargan test, and FE summary.
+Prints second-stage results, first-stage F-stats (displays "N/A (singular)" when unavailable), Sargan test, FE summary, and any rank diagnostics warnings.
+
+#### `.rank_diagnostics()`
+
+Inherited from `HDFE` — includes IV-specific diagnostic keys (see HDFE section above).
 
 ---
 
