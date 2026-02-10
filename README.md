@@ -13,9 +13,10 @@ Both classes live in [`HDFE.py`](HDFE.py). `HDFEIV` inherits from `HDFE` and fal
 
 1. **Demeaning** — Alternating projection over FE groups with Gearhart-Koshy (GK) acceleration.  Per-FE group constants (valid masks, inverse counts) are **precomputed once** before the iteration loop.  Each iteration batch-demeans $y$ and all $X$ columns together per FE group (avoiding per-column loops).  Convergence is checked every `convergence_check_interval` iterations (default 5), reducing snapshot overhead.  GPU path uses CuPy `bincount`/`scatter_add`; CPU path uses NumPy `bincount`.
 2. **Coefficient estimation** — OLS on demeaned data (`HDFE`) or direct 2SLS formula $\beta = (X'P_Z X)^{-1} X'P_Z y$ with original $X$ (`HDFEIV`).  If $X'X$ is singular after projection, falls back to `lstsq` with a warning.
-3. **FE recovery** — Sparse `D'D` system solved via `spsolve` (GPU: `cupyx`).  **Empty FE categories** (zero-diagonal entries in $D'D$) are pruned before solving.  Since `spsolve` silently returns NaN on singular matrices, the solver detects NaN output and falls back to `scipy.sparse.linalg.lsqr` (minimum-norm least-squares solution).  Set `singular_fallback='raise'` to get an exception instead.  When sample weights are active, the RHS is un-weighted before solving so FE coefficients are on the original scale.
-4. **Standard errors** — Sandwich estimator with the appropriate bread/meat for each SE type.  IV models use the IV-specific variance formula $A^{-1} B A^{-1}$ where $A = X'Z(Z'Z)^{-1}Z'X$.
-5. **IV singularity guards** — Three guards protect the HDFE-IV pipeline:
+3. **FE recovery with connected-component normalization** — A full dummy matrix $D$ (all categories for every FE, no arbitrary category dropping) is built, and fixed effects are recovered by solving a sparse normal-equation system.  For models with $\geq 2$ FE variables the $D'D$ system is rank-deficient: there is one null vector per **connected component** of the bipartite FE graph.  A Union-Find algorithm detects disconnected components, and one pin-to-zero constraint per component is added via an augmented system $(D'D + \lambda^2 C'C)\alpha = D'r$ with $\lambda^2 = 10^{12}$.  This makes the system full-rank without distorting the solution.  **Empty FE categories** (zero-diagonal entries) are still pruned before solving.  `spsolve` (GPU: `cupyx`) is used with automatic NaN detection; if the solve still fails, falls back to `scipy.sparse.linalg.lsqr` on the augmented system.  Set `singular_fallback='raise'` to get an exception instead.  When sample weights are active, the RHS is un-weighted before solving so FE coefficients are on the original scale.
+4. **Degrees of freedom** — Absorbed degrees of freedom are computed as $\sum_j N_j - C$ where $N_j$ is the number of categories for FE $j$ and $C$ is the number of connected components (equals 1 for a single FE).  This correctly accounts for the rank deficiency of the FE dummy matrix.
+5. **Standard errors** — Sandwich estimator with the appropriate bread/meat for each SE type.  IV models use the IV-specific variance formula $A^{-1} B A^{-1}$ where $A = X'Z(Z'Z)^{-1}Z'X$.
+6. **IV singularity guards** — Three guards protect the HDFE-IV pipeline:
    - *Guard 1 (first-stage restricted F-stat):* `matrix_rank` pre-check on $X_{exog}$ + `isfinite` post-check.
    - *Guard 2 (Z'Z inversion):* try/except + `isfinite` post-check on $(Z'Z)^{-1}$.
    - *Guard 3 (A inversion for SE):* try/except + `isfinite` post-check on $A^{-1}$.
@@ -80,6 +81,7 @@ Returns a `dict` of rank/singularity diagnostic information from the last `.fit(
 |---|---|
 | `XtX_singular` | $X'X$ was singular after demeaning; `lstsq` fallback used |
 | `empty_fe_categories` | Dict of FE vars with empty categories that were pruned |
+| `n_connected_components` | Number of connected components found in the multi-way FE graph (reported when > 1) |
 | `spsolve_nan` | `spsolve` returned NaN; `lsqr` fallback used |
 | `solve_exception` | `spsolve` raised an exception; `lsqr` fallback used |
 | `first_stage_restricted_singular` | Restricted first-stage regression singular (IV only) |

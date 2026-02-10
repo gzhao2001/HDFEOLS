@@ -1,7 +1,23 @@
-# HDFE.py
-# High-Dimensional Fixed Effects Estimators (CPU and GPU versions)
-import numpy as np
+"""
+HDFE / HDFE-IV  —  High-Dimensional Fixed Effects estimator
+===========================================================
+
+Two classes:
+  * HDFE    — OLS with multi-way absorbed fixed effects
+  * HDFEIV  — 2SLS-IV with multi-way absorbed fixed effects
+
+Features:
+  * Alternating-projection demeaning (basic or Gonzales–Kugler acceleration)
+  * Connected-component normalization for multi-way FE identification
+  * Sparse FE recovery with Union-Find bipartite graph analysis
+  * GPU (CuPy) support with automatic CPU fallback
+  * Heteroscedasticity-robust (HC1/HC2/HC3) and multi-way cluster SEs
+  * Rank diagnostics, singular_fallback, sample weights (WLS/W2SLS)
+  * Sargan over-identification test & first-stage partial-F diagnostics
+"""
+
 import pandas as pd
+import numpy as np
 from scipy import stats
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import spsolve
@@ -11,7 +27,8 @@ import warnings
 class HDFE:
     """
     High-Dimensional Fixed Effects estimator using alternating projection
-    demeaning with sparse-system fixed effects recovery.
+    demeaning with sparse-system fixed effects recovery and connected-component
+    normalization for multi-way FE identification.
     """
 
     def __init__(self, max_iter=5000, tolerance=1e-8, acceleration='gk',
@@ -44,6 +61,7 @@ class HDFE:
         self.category_to_index_ = {}
         self.n_categories = {}
         self._rank_diagnostics = {}
+        self._n_connected_components = 0
 
     # ── Category encoding (vectorised) ──────────────────────────────────────
 
@@ -71,7 +89,7 @@ class HDFE:
                                     .astype(int).values)
         return encoded_data
 
-    # ── Precomputed group info ──────────────────────────────────────────────
+    # ── Precomputed group info (Audit #2) ───────────────────────────────────
 
     def _precompute_group_info_cpu(self, group_indices, n_groups):
         """Precompute per-FE constants once before the iteration loop."""
@@ -112,7 +130,7 @@ class HDFE:
             'n_groups': n_groups,
         }
 
-    # ── Batch group demeaning ───────────────────────────────────────────────
+    # ── Batch group demeaning (Audit #1) ────────────────────────────────────
 
     def _cpu_demean_batch(self, y, X, ginfo):
         """Demean y (1-D) and X (2-D) by a single FE group. Returns new arrays."""
@@ -191,7 +209,7 @@ class HDFE:
                 group_ids_list = [
                     cp.asarray(encoded_data[fv].values, dtype=cp.int32)
                     for fv in fe_vars]
-                # Precompute group info once
+                # Audit #2: precompute group info once
                 group_infos = [
                     self._precompute_group_info_gpu(gids, self.n_categories[fv])
                     for gids, fv in zip(group_ids_list, fe_vars)]
@@ -206,7 +224,7 @@ class HDFE:
             y_proj = y.copy()
             X_proj = X.copy()
             group_ids_list = [encoded_data[fv].values for fv in fe_vars]
-            # Precompute group info once
+            # Audit #2: precompute group info once
             group_infos = [
                 self._precompute_group_info_cpu(gids, self.n_categories[fv])
                 for gids, fv in zip(group_ids_list, fe_vars)]
@@ -227,13 +245,13 @@ class HDFE:
                                        demean_batch):
         check_iv = self.convergence_check_interval
         for iteration in range(self.max_iter):
-            # Only snapshot + check periodically
+            # Audit #4: only snapshot + check periodically
             do_check = (iteration % check_iv == 0) or (iteration == self.max_iter - 1)
             if do_check:
                 y_old = y_proj.copy()
                 X_old = X_proj.copy()
 
-            # Batch demean y + all X columns per FE
+            # Audit #1: batch demean y + all X columns per FE
             for ginfo in group_infos:
                 y_proj, X_proj = demean_batch(y_proj, X_proj, ginfo)
 
@@ -269,11 +287,11 @@ class HDFE:
                 y_old = y_proj.copy()
                 X_old = X_proj.copy()
 
-            # Batch demean y + all X columns per FE
+            # Audit #1: batch demean y + all X columns per FE
             for ginfo in group_infos:
                 y_proj, X_proj = demean_batch(y_proj, X_proj, ginfo)
 
-            # Convergence check only periodically
+            # Audit #4: convergence check only periodically
             if do_check:
                 if self.use_gpu:
                     import cupy as cp
@@ -327,39 +345,92 @@ class HDFE:
                 return current + a * d1
         return current
 
+    # ── Connected-component normalization ───────────────────────────────────
+
+    def _find_connected_components(self, encoded_data, fe_vars):
+        """Find connected components in the multi-way FE bipartite graph
+        using Union-Find.
+
+        For ≥ 2 FEs the bipartite graph connects category nodes that co-occur
+        in observations.  Disconnected components each require one
+        normalization for identification.
+
+        Returns
+        -------
+        n_components : int
+            Number of normalizations needed (0 for single FE).
+        node_components : dict
+            Mapping (fe_idx, cat_id) → component_id.
+        """
+        if len(fe_vars) <= 1:
+            return 0, {}
+
+        # Node offsets: each (fe_idx, cat_id) → unique int
+        offsets = []
+        total_nodes = 0
+        for fv in fe_vars:
+            offsets.append(total_nodes)
+            total_nodes += self.n_categories[fv]
+
+        parent = np.arange(total_nodes, dtype=np.int64)
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]  # path compression
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(int(a)), find(int(b))
+            if ra != rb:
+                parent[rb] = ra
+
+        # Chain-union adjacent FE pairs per observation (on unique pairs)
+        gids = [encoded_data[fv].values for fv in fe_vars]
+        for fi in range(len(fe_vars) - 1):
+            a = offsets[fi] + gids[fi]
+            b = offsets[fi + 1] + gids[fi + 1]
+            valid = (gids[fi] >= 0) & (gids[fi + 1] >= 0)
+            pairs = np.unique(
+                np.column_stack([a[valid], b[valid]]), axis=0)
+            for pa, pb in pairs:
+                union(pa, pb)
+
+        # Assign sequential component labels
+        comp_labels = {}
+        node_components = {}
+        for fi, fv in enumerate(fe_vars):
+            for cat in range(self.n_categories[fv]):
+                root = find(offsets[fi] + cat)
+                if root not in comp_labels:
+                    comp_labels[root] = len(comp_labels)
+                node_components[(fi, cat)] = comp_labels[root]
+
+        return len(comp_labels), node_components
+
     # ── Sparse dummy matrix & FE recovery ───────────────────────────────────
 
     def _build_dummy_matrix(self, encoded_data, fe_vars):
-        """Build sparse dummy matrix for FE recovery (vectorised)."""
+        """Build full sparse dummy matrix for FE recovery (all categories
+        included — normalisation handled by connected-component constraints)."""
         if len(fe_vars) == 0:
             raise ValueError("fe_vars must be non-empty for dummy matrix construction")
         n_obs = len(encoded_data)
-        total_cols = self.n_categories[fe_vars[0]]
-        for fv in fe_vars[1:]:
-            total_cols += self.n_categories[fv] - 1
+        total_cols = sum(self.n_categories[fv] for fv in fe_vars)
 
         all_rows, all_cols = [], []
         fe_col_info = {}
         cur = 0
-        for fe_idx, fv in enumerate(fe_vars):
+        for fv in fe_vars:
             nc = self.n_categories[fv]
             gids = encoded_data[fv].values
-            if fe_idx == 0:
-                fe_col_info[fv] = {
-                    'start_col': cur, 'end_col': cur + nc,
-                    'n_categories': nc, 'dropped_category': None}
-                v = gids >= 0
-                all_rows.append(np.where(v)[0])
-                all_cols.append(cur + gids[v])
-                cur += nc
-            else:
-                fe_col_info[fv] = {
-                    'start_col': cur, 'end_col': cur + nc - 1,
-                    'n_categories': nc, 'dropped_category': 0}
-                v = gids >= 1
-                all_rows.append(np.where(v)[0])
-                all_cols.append(cur + gids[v] - 1)
-                cur += nc - 1
+            fe_col_info[fv] = {
+                'start_col': cur, 'end_col': cur + nc,
+                'n_categories': nc}
+            v = gids >= 0
+            all_rows.append(np.where(v)[0])
+            all_cols.append(cur + gids[v])
+            cur += nc
 
         ri = np.concatenate(all_rows)
         ci = np.concatenate(all_cols)
@@ -371,7 +442,13 @@ class HDFE:
                                 y_projected, X_projected,
                                 sample_weight=None,
                                 singular_fallback='lsqr'):
-        """Recover FE coefficients using sparse solver (weight-aware)."""
+        """Recover FE coefficients with connected-component normalization.
+
+        For ≥ 2 FE variables the D'D system is rank-deficient (one null
+        vector per connected component of the FE bipartite graph).  We add
+        one pin-to-zero constraint per component, forming an augmented
+        normal-equation system that is always full-rank.
+        """
         if self.verbose:
             print("Recovering fixed effects using sparse solver...")
         if len(self.fe_vars) == 0:
@@ -382,18 +459,27 @@ class HDFE:
         res_proj = y_projected - X_projected @ beta
         rhs = res_orig - res_proj
 
-        # Undo sqrt-weighting so FE recovery is in the original scale
+        # C7: undo sqrt-weighting so FE recovery is in the original scale
         if sample_weight is not None:
             sw = np.sqrt(sample_weight)
             sw_safe = np.where(sw > 0, sw, 1.0)
             rhs = rhs / sw_safe
 
         from scipy.sparse.linalg import lsqr
+        from scipy.sparse import vstack
 
-        # Prune columns with zero observations (empty categories)
-        DtD = D.T @ D
-        diag_DtD = np.array(DtD.diagonal()).ravel()
-        empty_cols = np.where(diag_DtD == 0)[0]
+        # ── Connected-component normalization ──
+        n_components, node_components = self._find_connected_components(
+            encoded_data, self.fe_vars)
+        self._n_connected_components = n_components
+        if n_components > 1 and self.verbose:
+            print(f"  Found {n_components} connected components in FE graph")
+        if n_components > 1:
+            self._rank_diagnostics['n_connected_components'] = n_components
+
+        # ── Prune columns with zero observations (empty categories) ──
+        DtD_diag = np.array((D.T @ D).diagonal()).ravel()
+        empty_cols = np.where(DtD_diag == 0)[0]
 
         if len(empty_cols) > 0:
             empty_fe_info = {}
@@ -405,41 +491,76 @@ class HDFE:
                     empty_fe_info[fv] = len(fe_empty)
 
             self._rank_diagnostics['empty_fe_categories'] = empty_fe_info
-            msg = (f"D'D has {len(empty_cols)} zero-diagonal entries "
-                   f"(empty FE categories): {empty_fe_info}")
-            if singular_fallback == 'raise':
-                raise np.linalg.LinAlgError(
-                    msg + ". Set singular_fallback='lsqr' to use "
-                    "least-squares fallback.")
-
             if self.verbose:
-                print(f"  ⚠️ {msg}, pruning before solve...")
-            keep_cols = np.where(diag_DtD > 0)[0]
-            D_pruned = D[:, keep_cols]
-            DtD = D_pruned.T @ D_pruned
-            Dtr = D_pruned.T @ rhs
+                print(f"  ⚠️ {len(empty_cols)} empty FE categories, pruning...")
+            keep_cols = np.where(DtD_diag > 0)[0]
+            D = D[:, keep_cols]
         else:
-            Dtr = D.T @ rhs
             keep_cols = None
 
+        total_solve_cols = D.shape[1]
+
+        # ── Build pin-to-zero constraint matrix C ──
+        constraint_rows, constraint_cols = [], []
+        if n_components > 0:
+            col_component = {}
+            for fi, fv in enumerate(self.fe_vars):
+                info = fe_col_info[fv]
+                for cat in range(info['n_categories']):
+                    orig_col = info['start_col'] + cat
+                    if keep_cols is not None:
+                        pos = np.searchsorted(keep_cols, orig_col)
+                        if pos < len(keep_cols) and keep_cols[pos] == orig_col:
+                            col_component[int(pos)] = node_components.get(
+                                (fi, cat), -1)
+                    else:
+                        col_component[orig_col] = node_components.get(
+                            (fi, cat), -1)
+
+            # One constraint per component: pin first column encountered
+            pinned = set()
+            for col_idx in sorted(col_component.keys()):
+                comp_id = col_component[col_idx]
+                if comp_id >= 0 and comp_id not in pinned:
+                    constraint_rows.append(len(pinned))
+                    constraint_cols.append(col_idx)
+                    pinned.add(comp_id)
+
+        n_constraints = len(constraint_rows)
+        lam2 = 1e12  # λ² — near-exact constraint weight
+
+        if n_constraints > 0:
+            C = csr_matrix(
+                (np.ones(n_constraints, dtype=np.float64),
+                 (constraint_rows, constraint_cols)),
+                shape=(n_constraints, total_solve_cols))
+            DtD = D.T @ D + lam2 * (C.T @ C)
+        else:
+            C = None
+            DtD = D.T @ D
+        Dtr = D.T @ rhs
+
+        # ── Solve ──
         try:
-            if self.use_gpu:
-                try:
-                    import cupy as cp
-                    import cupyx.scipy.sparse as csp
-                    import cupyx.scipy.sparse.linalg as cspl
-                    alpha_solve = cp.asnumpy(cspl.spsolve(
-                        csp.csr_matrix(DtD.astype(np.float64)),
-                        cp.asarray(Dtr.astype(np.float64))))
-                except Exception:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                if self.use_gpu:
+                    try:
+                        import cupy as cp
+                        import cupyx.scipy.sparse as csp
+                        import cupyx.scipy.sparse.linalg as cspl
+                        alpha_solve = cp.asnumpy(cspl.spsolve(
+                            csp.csr_matrix(DtD.astype(np.float64)),
+                            cp.asarray(Dtr.astype(np.float64))))
+                    except Exception:
+                        alpha_solve = spsolve(DtD, Dtr)
+                else:
                     alpha_solve = spsolve(DtD, Dtr)
-            else:
-                alpha_solve = spsolve(DtD, Dtr)
 
             # spsolve silently returns NaN on singular matrices
             if not np.all(np.isfinite(alpha_solve)):
-                msg = ("spsolve returned NaN — D'D is singular "
-                       "(collinear fixed effects)")
+                msg = ("spsolve returned NaN — D'D still singular "
+                       "after CC normalization")
                 self._rank_diagnostics['spsolve_nan'] = True
                 if singular_fallback == 'raise':
                     raise np.linalg.LinAlgError(
@@ -447,8 +568,10 @@ class HDFE:
                         "least-squares fallback.")
                 if self.verbose:
                     print(f"  ⚠️ {msg}, falling back to lsqr...")
-                if keep_cols is not None:
-                    alpha_solve = lsqr(D_pruned, rhs)[0]
+                if C is not None:
+                    D_aug = vstack([D, np.sqrt(lam2) * C])
+                    rhs_aug = np.concatenate([rhs, np.zeros(n_constraints)])
+                    alpha_solve = lsqr(D_aug, rhs_aug)[0]
                 else:
                     alpha_solve = lsqr(D, rhs)[0]
 
@@ -463,28 +586,28 @@ class HDFE:
                     "least-squares fallback.")
             if self.verbose:
                 print(f"  ⚠️ {msg}, falling back to lsqr...")
-            if keep_cols is not None:
-                alpha_solve = lsqr(D_pruned, rhs)[0]
+            if C is not None:
+                D_aug = vstack([D, np.sqrt(lam2) * C])
+                rhs_aug = np.concatenate([rhs, np.zeros(n_constraints)])
+                alpha_solve = lsqr(D_aug, rhs_aug)[0]
             else:
                 alpha_solve = lsqr(D, rhs)[0]
 
         # Re-insert zeros for pruned columns
         if keep_cols is not None:
-            alpha = np.zeros(D.shape[1])
+            total_orig_cols = sum(
+                self.n_categories[fv] for fv in self.fe_vars)
+            alpha = np.zeros(total_orig_cols)
             alpha[keep_cols] = alpha_solve
         else:
             alpha = alpha_solve
 
+        # Extract per-FE coefficients (full matrix — all categories present)
         fe_coefficients = {}
-        for fe_idx, fv in enumerate(self.fe_vars):
+        for fv in self.fe_vars:
             info = fe_col_info[fv]
-            nc = info['n_categories']
-            if fe_idx == 0:
-                fe_coefficients[fv] = alpha[info['start_col']:info['end_col']]
-            else:
-                c = np.zeros(nc)
-                c[1:] = alpha[info['start_col']:info['end_col']]
-                fe_coefficients[fv] = c
+            fe_coefficients[fv] = alpha[info['start_col']:info['end_col']]
+
         if self.verbose:
             for fv, c in fe_coefficients.items():
                 print(f"  {fv}: mean={np.mean(c):.6f}, std={np.std(c):.6f}")
@@ -498,6 +621,7 @@ class HDFE:
         if singular_fallback not in ('lsqr', 'raise'):
             raise ValueError("singular_fallback must be 'lsqr' or 'raise'")
         self._rank_diagnostics = {}
+        self._n_connected_components = 0
         valid_se_types = ['homoscedastic', 'hc1', 'hc2', 'hc3', 'cluster']
         if se_type not in valid_se_types:
             raise ValueError(f"se_type must be one of {valid_se_types}")
@@ -505,7 +629,7 @@ class HDFE:
             raise ValueError("cluster_vars required when se_type='cluster'")
         if se_type == 'cluster' and not isinstance(cluster_vars, list):
             cluster_vars = [cluster_vars]
-        if not fe_vars:
+        if not fe_vars:                                         # H2
             raise ValueError("fe_vars must be non-empty for HDFE estimation")
 
         self.se_type = se_type
@@ -526,6 +650,7 @@ class HDFE:
         y = data[y_col].values.astype(np.float64)
         X = data[X_cols].values.astype(np.float64)
         valid_mask = ~(np.isnan(y) | np.any(np.isnan(X), axis=1))
+        # H-REMAIN-1: exclude rows with NaN in FE columns
         for fv in fe_vars:
             valid_mask &= data[fv].notna().values
         y = y[valid_mask]; X = X[valid_mask]
@@ -549,6 +674,7 @@ class HDFE:
                 "solution. Check for collinear regressors.", stacklevel=2)
             self.coefficients_, _, _, _ = np.linalg.lstsq(
                 X_proj, y_proj, rcond=None)
+        # C7: pass weights for correct FE recovery
         self.fe_coefficients_ = self._recover_fixed_effects(
             y, X, encoded_data, self.coefficients_, y_proj, X_proj,
             sample_weight=self._sample_weight,
@@ -584,10 +710,18 @@ class HDFE:
         if hc_type == 'hc1':
             w = (residuals**2) * n / (n - k)
         elif hc_type == 'hc2':
-            h = np.sum(X * np.linalg.solve(X.T @ X, X.T).T, axis=1)
+            try:
+                h = np.sum(X * np.linalg.solve(X.T @ X, X.T).T, axis=1)
+            except np.linalg.LinAlgError:
+                h = np.sum(X * np.linalg.pinv(X.T @ X).dot(X.T).T, axis=1)
+            h = np.clip(h, 0, 1 - 1e-10)
             w = (residuals**2) / (1 - h)
         elif hc_type == 'hc3':
-            h = np.sum(X * np.linalg.solve(X.T @ X, X.T).T, axis=1)
+            try:
+                h = np.sum(X * np.linalg.solve(X.T @ X, X.T).T, axis=1)
+            except np.linalg.LinAlgError:
+                h = np.sum(X * np.linalg.pinv(X.T @ X).dot(X.T).T, axis=1)
+            h = np.clip(h, 0, 1 - 1e-10)
             w = (residuals**2) / ((1 - h)**2)
         w = np.where(np.isfinite(w) & (w >= 0), w, 0.0)
         wX = X * np.sqrt(w).reshape(-1, 1)
@@ -658,11 +792,11 @@ class HDFE:
         rss = np.sum(resid**2)
         self.r_squared_ = 1 - rss / tss
 
-        # dof
+        # dof: absorbed = sum(Ni) − n_connected_components
         if len(self.fe_vars) > 0:
-            df_abs = self.n_categories[self.fe_vars[0]]
-            for fv in self.fe_vars[1:]:
-                df_abs += self.n_categories[fv] - 1
+            n_cc = self._n_connected_components
+            df_abs = sum(self.n_categories[fv]
+                         for fv in self.fe_vars) - n_cc
         else:
             df_abs = 0
         self._df_resid = max(len(y) - X.shape[1] - df_abs, 1)
@@ -713,6 +847,8 @@ class HDFE:
         if hasattr(self, 'cluster_vars') and self.cluster_vars:
             print(f"Clustering: {self.cluster_vars}")
         print(f"FE categories: {dict(self.n_categories)}")
+        if self._n_connected_components > 1:
+            print(f"Connected components: {self._n_connected_components}")
         hdr = f"\n{'Variable':<20} {'Coef':<12} {'Std Err':<12} {'t':<8} {'P>|t|':<8}"
         print(hdr); print("-" * 60)
         for i, v in enumerate(self.X_cols):
@@ -800,6 +936,7 @@ class HDFEIV(HDFE):
         if singular_fallback not in ('lsqr', 'raise'):
             raise ValueError("singular_fallback must be 'lsqr' or 'raise'")
         self._rank_diagnostics = {}
+        self._n_connected_components = 0
 
         self._instruments = instruments
         self._endogenous_vars = endogenous_vars if endogenous_vars else []
@@ -903,11 +1040,11 @@ class HDFEIV(HDFE):
         self.X_projected = X_demeaned
         self.y_projected = y_demeaned
 
-        # dof
+        # dof: absorbed = sum(Ni) − n_connected_components
         if len(self.fe_vars) > 0:
-            df_absorbed = self.n_categories[self.fe_vars[0]]
-            for fe in self.fe_vars[1:]:
-                df_absorbed += self.n_categories[fe] - 1
+            n_cc = self._n_connected_components
+            df_absorbed = sum(self.n_categories[fv]
+                              for fv in self.fe_vars) - n_cc
         else:
             df_absorbed = 0
         self._df_resid = max(len(y) - X.shape[1] - df_absorbed, 1)
@@ -971,8 +1108,7 @@ class HDFEIV(HDFE):
 
                 # Partial F-stat for *excluded* instruments only
                 if len(exog_indices) > 0:
-                    # Guard 1: rank check before solve (solve on near-singular
-                    # matrices returns finite garbage instead of raising)
+                    # Guard 1: rank check before solve
                     if np.linalg.matrix_rank(X_exog) < X_exog.shape[1]:
                         f_stat = np.nan
                         self._rank_diagnostics[
@@ -1226,6 +1362,8 @@ class HDFEIV(HDFE):
         print(f"Endogenous: {self._endogenous_vars}")
         print(f"Excluded instruments: {self._instruments}")
         print(f"Exogenous: {self._exogenous_vars}")
+        if self._n_connected_components > 1:
+            print(f"Connected components: {self._n_connected_components}")
 
         print("\nFirst Stage:")
         print("-" * 60)
